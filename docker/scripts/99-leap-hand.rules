@@ -1,0 +1,16 @@
+# TuinaDex udev rules: 让非 root 容器/用户访问 LEAP Hand 与 ZDT CAN
+#
+# 安装到 host: sudo cp 99-leap-hand.rules /etc/udev/rules.d/
+# 重载:        sudo udevadm control --reload && sudo udevadm trigger
+#
+# 若 Docker 使用 privileged, 这些规则可不改；只用 device 透传时建议加
+
+# LEAP Hand (FTDI USB-Serial 桥接器, 大多数 USB2Dynamixel)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE="0666", GROUP="dialout"
+# Robotis USB2Dynamixel (某些型号)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="16d0", ATTRS{idProduct}=="0f9a", MODE="0666", GROUP="dialout"
+# Intel RealSense (D455 等)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b5c", MODE="0666"
+
+# SocketCAN native (can0) — 容器需 --network=host 才能用
+# 见 docker/README.md §硬件访问

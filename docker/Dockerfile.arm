@@ -1,0 +1,76 @@
+"""
+TuinaDex arm-control image — 机械臂控制容器 (ZDT 直连 + LeRobot 适配)
+
+镜像职责:
+  - 6-DOF 机械臂 (ZDT 步进闭环驱动器) 控制回路
+  - LeRobot 0.4.4 适配 (MassageRobot, transport="can")
+  - ZDT CAN 帧驱动 + 安全层 (clamp / e_stop / 看门狗)
+  - 仿真支持 (mujoco 仿真 + camera_server)
+  - 与 hand-control / vla-train 容器共享 dataset volume
+
+构建镜像:
+  docker build -f Dockerfile.arm -t tuinadex/arm:0.1 .
+
+进入容器运行:
+  docker compose --profile control run --rm arm
+  cd /workspace/TuinaDex/Arm-robot_VLA
+  python scripts/zdt_bringup.py status
+"""
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LANG=C.UTF-8 \
+    CONDA_DIR=/opt/conda
+
+# ---- 基础依赖 ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git curl wget ca-certificates \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        iproute2 can-utils usbutils \
+        python3.10 python3.10-venv python3.10-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Miniconda + 环境 (与 host 对齐) ----
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/mc.sh \
+    && bash /tmp/mc.sh -b -p $CONDA_DIR \
+    && rm /tmp/mc.sh \
+    && $CONDA_DIR/bin/conda clean -afy
+
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+# ---- conda env 'smolvla' (基础 Python 3.10) ----
+COPY conda/smolvla-history.yml /tmp/smolvla-history.yml
+RUN conda env create -f /tmp/smolvla-history.yml && \
+    conda clean -afy
+
+SHELL ["conda", "run", "-n", "smolvla", "/bin/bash", "-c"]
+
+# ---- 关键 pip 依赖 (与 Arm-robot_VLA/setup 对齐) ----
+RUN pip install --no-cache-dir \
+        lerobot==0.4.4 \
+        python-can[socketcan] \
+        pyserial \
+        numpy \
+        opencv-python \
+        mujoco==3.10.0 \
+        safetensors \
+        transformers \
+        av \
+        Pillow \
+        pyarrow \
+        torch --index-url https://download.pytorch.org/whl/cu128
+
+# ---- Workspace ----
+WORKDIR /workspace
+RUN mkdir -p /workspace/TuinaDex
+ENV WORKSPACE=/workspace/TuinaDex
+
+# ---- 入口点：默认 bash，方便调试 ----
+ENTRYPOINT ["conda", "run", "-n", "smolvla"]
+CMD ["/bin/bash"]
+
+# ---- 健康检查 ----
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD conda run -n smolvla python -c "import lerobot_robot_massage; print('OK')" || exit 1

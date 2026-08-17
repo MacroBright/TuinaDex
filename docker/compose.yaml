@@ -1,0 +1,127 @@
+# TuinaDex 多 Container 编排
+#
+# 启动方式:
+#   cd TuinaDex/docker
+#   docker compose --profile control up                # arm + hand
+#   docker compose --profile vla up                    # 加 VLA 训练/推理 (GPU)
+#   docker compose --profile sim up                    # 纯仿真 (无硬件)
+#   docker compose --profile control run --rm arm      # 进入 arm 容器调试
+#
+# 关键约束 (见 README.md):
+#   - SocketCAN 必须 --network=host (CAN namespace 不能跨 UTS 隔离)
+#   - LEAP Hand USB 通过 --device 透传 (无需 --privileged)
+#   - 共享 dataset volume: tuinadex-datasets (挂到 /workspace/datasets)
+#   - X11 透传用于 MuJoCo 可视化 (可选)
+
+version: "3.8"
+
+# ─── 卷 (datasets/checkpoints 共享) ───
+volumes:
+  tuinadex-datasets:
+    driver: local
+  tuinadex-checkpoints:
+    driver: local
+  tuinadex-logs:
+    driver: local
+
+# ─── 网络 ───
+networks:
+  tuinadex-control:
+    driver: bridge
+  tuinadex-vla:
+    driver: bridge
+
+# ─── 服务 ───
+services:
+
+  # ─── 机械臂控制 (ZDT 直连 CAN) ───
+  arm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.arm
+    image: tuinadex/arm:0.1
+    container_name: tuinadex-arm
+    profiles: [control, vla, sim]
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      PYTHONPATH: /workspace/TuinaDex
+    volumes:
+      - tuinadex-datasets:/workspace/datasets
+      - tuinadex-checkpoints:/workspace/checkpoints
+      - tuinadex-logs:/workspace/logs
+      - ../Arm-robot_VLA:/workspace/TuinaDex/Arm-robot_VLA:rw
+    devices:
+      # ZDT 驱动器若用 USB-CAN 适配器 (如 PEAK/IXXAT) → 这里加:
+      # - /dev/ttyUSB0:/dev/ttyUSB0
+      # SocketCAN (can0) 必须走 host network (见下)
+    network_mode: host          # 关键: SocketCAN 必需 host netns
+    privileged: false
+    cap_add: [NET_ADMIN]       # 允许容器内 ip link (设置 CAN bitrate)
+    command: ["bash", "-lc", "echo 'arm-control ready' && tail -f /workspace/logs/arm.log"]
+
+  # ─── 灵巧手控制 (LEAP Hand USB 直连) ───
+  hand:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.hand
+    image: tuinadex/hand:0.1
+    container_name: tuinadex-hand
+    profiles: [control, vla, sim]
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      PYTHONPATH: /workspace/TuinaDex
+    volumes:
+      - tuinadex-datasets:/workspace/datasets
+      - tuinadex-checkpoints:/workspace/checkpoints
+      - tuinadex-logs:/workspace/logs
+      - ../Leap_Hand:/workspace/TuinaDex/Leap_Hand:rw
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+      # RealSense 相机 (按需)
+      # - /dev/bus/usb:/dev/bus/usb
+    privileged: false
+    networks:
+      - tuinadex-control
+    command: ["bash", "-lc", "echo 'hand-control ready' && tail -f /workspace/logs/hand.log"]
+
+  # ─── VLA 训练/推理 (SmolVLA, GPU heavy) ───
+  vla-train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.arm  # 共用 arm 镜像 (含 lerobot + torch)
+    image: tuinadex/vla:0.1
+    container_name: tuinadex-vla
+    profiles: [vla]
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      PYTHONPATH: /workspace/TuinaDex
+    volumes:
+      - tuinadex-datasets:/workspace/datasets
+      - tuinadex-checkpoints:/workspace/checkpoints
+      - tuinadex-logs:/workspace/logs
+      - ../Arm-robot_VLA:/workspace/TuinaDex/Arm-robot_VLA:rw
+      - ../Leap_Hand:/workspace/TuinaDex/Leap_Hand:rw
+    networks:
+      - tuinadex-vla
+    command: ["bash", "-lc", "python -m lerobot.scripts.lerobot_train --config /workspace/TuinaDex/Arm-robot_VLA/configs/train_smolvla.yaml"]
+
+  # ─── 仿真桥接容器 (MuJoCo 仿真 TCP server, 跨容器共享) ───
+  sim-bridge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.arm
+    image: tuinadex/sim:0.1
+    container_name: tuinadex-sim
+    profiles: [sim]
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      PYTHONPATH: /workspace/TuinaDex
+    volumes:
+      - tuinadex-datasets:/workspace/datasets
+      - ../Arm-robot_VLA:/workspace/TuinaDex/Arm-robot_VLA:rw
+    network_mode: host
+    command: ["bash", "-lc", "cd /workspace/TuinaDex/Arm-robot_VLA && python scripts/mujoco_sim.py --ik --no-camera"]

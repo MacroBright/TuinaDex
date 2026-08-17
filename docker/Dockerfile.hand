@@ -1,0 +1,75 @@
+"""
+TuinaDex hand-control image — 灵巧手控制容器 (LEAP Hand + 视觉遥操)
+
+镜像职责:
+  - LEAP Hand 14-DOF 灵巧手控制 (Dynamixel SDK, USB 直连)
+  - D455 视觉遥操: MediaPipe 21kp → LEAP 16-DOF 关节映射
+  - HaMeR 3D MANO 集成的可选推理 (GPU)
+  - 仿真模式: Simulated Leap (MuJoCo) 可选
+  - 与 arm-control 容器共享 dataset volume
+
+构建镜像:
+  docker build -f Dockerfile.hand -t tuinadex/hand:0.1 .
+
+进入容器运行:
+  docker compose --profile control run --rm hand
+  cd /workspace/TuinaDex/Leap_Hand/python
+  python gesture_mapping/demo_realtime.py
+"""
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LANG=C.UTF-8 \
+    CONDA_DIR=/opt/conda
+
+# ---- 基础依赖 ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git curl wget ca-certificates \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        libudev-dev libusb-1.0-0-dev \
+        usbutils udev \
+        python3.10 python3.10-venv python3.10-dev \
+        portaudio19-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Miniconda (与 arm 镜像同 base) ----
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/mc.sh \
+    && bash /tmp/mc.sh -b -p $CONDA_DIR \
+    && rm /tmp/mc.sh \
+    && $CONDA_DIR/bin/conda clean -afy
+
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+# ---- 灵巧手环境 (与 Leap_Hand/python/readme.md 对齐) ----
+RUN conda create -n leap_hand python=3.14 -y && \
+    conda clean -afy
+
+SHELL ["conda", "run", "-n", "leap_hand", "/bin/bash", "-c"]
+
+# ---- 关键 pip 依赖: dynamixel-sdk + mediapipe + pyrealsense2 + opencv ----
+RUN pip install --no-cache-dir \
+        dynamixel-sdk==4.0.5 \
+        mediapipe==1.0.0 \
+        opencv-contrib-python==5.0.0 \
+        pyrealsense2 \
+        pyserial \
+        numpy==2.5.1 \
+        sounddevice \
+        hamer
+
+# ---- udev 规则: 让容器识别 LEAP Hand USB ----
+COPY scripts/99-leap-hand.rules /etc/udev/rules.d/99-leap-hand.rules
+
+# ---- Workspace ----
+WORKDIR /workspace
+RUN mkdir -p /workspace/TuinaDex
+ENV WORKSPACE=/workspace/TuinaDex
+
+ENTRYPOINT ["conda", "run", "-n", "leap_hand"]
+CMD ["/bin/bash"]
+
+# ---- 健康检查 ----
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD conda run -n leap_hand python -c "import dynamixel_sdk; import mediapipe; print('OK')" || exit 1

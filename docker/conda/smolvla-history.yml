@@ -1,0 +1,8 @@
+name: smolvla
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - opencv
