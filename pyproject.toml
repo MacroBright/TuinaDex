@@ -1,0 +1,123 @@
+# TuinaDex 顶层构建入口 (monorepo 风格)
+#
+# 设计: 顶层作为 "umbrella" 包, 不复制任何 submodule 代码;
+# 引用两个子系统的 editable install 通过 scripts/setup_dev.sh 实现.
+#
+# 安装顺序:
+#   git clone --recurse-submodules https://github.com/MacroBright/TuinaDex.git
+#   cd TuinaDex
+#   bash scripts/setup_dev.sh        # 一键安装两个 submodule 的 editable
+#   pip install -e .                 # 安装顶层 app 包
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tuinadex"
+version = "0.1.0"
+description = "TuinaDex — 机械臂+灵巧手统一机器人系统 (VLA + LeRobot + ZDT + LEAP Hand)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "TuinaDex Team", email = "bright@example.com" },
+]
+keywords = ["robotics", "vla", "lerobot", "embodied-ai", "massage", "manipulation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# 顶层运行时依赖 (不含 PyTorch / lerobot 等大件, 见 Dockerfile)
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python>=5.0",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+# GPU 训练依赖 (在 Dockerfile.arm 里已经装好, 这里可选)
+vla = [
+    "torch>=2.10",
+    "lerobot==0.4.4",
+    "safetensors",
+    "transformers",
+    "av",
+    "pyarrow",
+    "mujoco==3.10.0",
+]
+# 灵巧手依赖
+hand = [
+    "dynamixel-sdk==4.0.5",
+    "mediapipe==1.0.0",
+    "opencv-contrib-python>=5.0",
+    "pyrealsense2",
+    "sounddevice",
+]
+# 机械臂 CAN 依赖 (含 STM32 串口 + SocketCAN)
+arm = [
+    "python-can[socketcan]",
+]
+# 开发依赖
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "black",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/MacroBright/TuinaDex"
+Arm = "https://github.com/MacroBright/Arm-robot_VLA"
+Hand = "https://github.com/MacroBright/Leap_hand"
+Issues = "https://github.com/MacroBright/TuinaDex/issues"
+
+# ─── 顶层包 ───
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apps*", "packages*"]
+exclude = [
+    "Arm-robot_VLA*",
+    "Leap_Hand*",
+    "docker*",
+    "docs*",
+    "scripts*",
+    "tools*",
+    "experiments*",
+]
+
+# ─── 工具配置 ───
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "Arm-robot_VLA",
+    "Leap_Hand",
+    "docker",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # 长行（docstring 中允许）
+
+[tool.pytest.ini_options]
+testpaths = ["apps", "packages"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests (requires hardware)",
+]

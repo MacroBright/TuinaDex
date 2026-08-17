@@ -8,15 +8,25 @@
 ## 集成架构
 
 ```
-TuinaDex/                          ← 本仓库（顶层协调 + Docker 编排）
-├── Arm-robot_VLA/                 ← git submodule: 机械臂（6-DOF，ZDT CAN 直连）
-├── Leap_Hand/                     ← git submodule: 灵巧手（16-DOF，USB 直连）
-├── docker/                        ← Docker 双镜像 + compose
+TuinaDex/                          ← 本仓库（顶层协调 + 跨子系统包装层）
+├── apps/                          ← 跨子系统应用层 (主战场)
+│   ├── massage/                   ← 22-DOF 机械臂+灵巧手 (MassageRobotV2)
+│   └── teleop/                    ← 视觉遥操（占位）
+├── packages/                      ← 跨子系统共享工具 (占位)
+│   ├── common_math/               ← 数学工具 (rotation / IK / 滤波)
+│   └── common_vis/                ← 视觉工具 (camera / 关键点 / 共享内存帧)
+├── docker/                        ← Docker 多 Container 编排
 │   ├── Dockerfile.arm              ← 镜像: arm-control（lerobot + zdt + python-can）
 │   ├── Dockerfile.hand             ← 镜像: hand-control（dynamixel_sdk + mediapipe）
 │   └── compose.yaml               ← 多 Container 编排（arm/hand 独立进程）
+├── tools/                         ← 顶层脚本
+│   └── bump_submodules.sh         ← 一键 bump submodule 引用
+├── scripts/                       ← 顶层运维
+│   └── setup_dev.sh               ← 一键安装开发环境
 ├── docs/                          ← 跨项目集成文档
-└── scripts/                       ← 跨项目启动脚本（arm+hand 协同）
+├── pyproject.toml                 ← 顶层构建入口 (umbrella 包)
+├── Arm-robot_VLA/                 ← git submodule: 机械臂（6-DOF，ZDT CAN 直连）
+└── Leap_Hand/                     ← git submodule: 灵巧手（16-DOF，USB 直连）
 ```
 
 ## 架构决策（合并自各子项目 ADR）
@@ -43,9 +53,9 @@ TuinaDex/                          ← 本仓库（顶层协调 + Docker 编排�
 ### 初始化 submodule
 
 ```bash
-git clone https://github.com/MacroBright/TuinaDex.git
+git clone --recurse-submodules https://github.com/MacroBright/TuinaDex.git
 cd TuinaDex
-git submodule update --init --recursive   # 拉取两个子项目
+bash scripts/setup_dev.sh   # 一键安装顶层 + 两个 submodule 的 editable
 ```
 
 ### 启动 Docker 编排
@@ -86,10 +96,11 @@ git checkout -b feat/my-feature
 git commit -m "feat: ..."
 git push origin feat/my-feature
 
-# 回到顶层记录 submodule 引用
+# 回到顶层一键 bump
 cd ..
+bash tools/bump_submodules.sh Arm-robot_VLA
 git add Arm-robot_VLA
-git commit -m "chore(submodule): Arm-robot_VLA → feat/my-feature"
+git commit -m "chore(submodule): Arm-robot_VLA → new commit"
 git push
 ```
 
