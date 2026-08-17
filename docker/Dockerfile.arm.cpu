@@ -1,0 +1,68 @@
+"""
+TuinaDex arm-control image (CPU-only variant) — 骨架验证用
+
+镜像职责: 与 Dockerfile.arm 相同, 但 base 用 ubuntu:22.04 而非 nvidia/cuda
+  - 跳过 CUDA, 便于在无 GPU 机器上验证骨架
+  - PyTorch 安装为 CPU 版本
+  - 真机 GPU 训练请用 Dockerfile.arm
+
+构建:
+  docker build -f Dockerfile.arm.cpu -t tuinadex/arm:0.1-cpu .
+
+测试:
+  docker run --rm -it tuinadex/arm:0.1-cpu bash
+  conda activate smolvla
+  python -c "import lerobot, mujoco; print('OK')"
+"""
+FROM ubuntu:22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LANG=C.UTF-8 \
+    CONDA_DIR=/opt/conda
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git curl wget ca-certificates \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        iproute2 can-utils usbutils \
+        python3.10 python3.10-venv python3.10-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/mc.sh \
+    && bash /tmp/mc.sh -b -p $CONDA_DIR \
+    && rm /tmp/mc.sh \
+    && $CONDA_DIR/bin/conda clean -afy
+
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+COPY conda/smolvla-history.yml /tmp/smolvla-history.yml
+RUN conda env create -f /tmp/smolvla-history.yml && \
+    conda clean -afy
+
+WORKDIR /workspace
+RUN mkdir -p /workspace/TuinaDex
+ENV WORKSPACE=/workspace/TuinaDex
+
+SHELL ["conda", "run", "-n", "smolvla", "/bin/bash", "-c"]
+
+# ---- 关键 pip 依赖 (CPU 版) ----
+RUN pip install --no-cache-dir \
+        lerobot==0.4.4 \
+        python-can[socketcan] \
+        pyserial \
+        numpy \
+        opencv-python \
+        mujoco==3.10.0 \
+        safetensors \
+        transformers \
+        av \
+        Pillow \
+        pyarrow \
+        torch --index-url https://download.pytorch.org/whl/cpu
+
+ENTRYPOINT ["conda", "run", "-n", "smolvla"]
+CMD ["/bin/bash"]
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD conda run -n smolvla python -c "import lerobot; print('OK')" || exit 1
