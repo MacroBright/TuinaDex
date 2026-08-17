@@ -50,3 +50,14 @@ print('[OK] lerobot_robot_massage.MassageRobot')
 from leap_hand_utils.dynamixel_client import DynamixelClient
 print('[OK] leap_hand_utils.DynamixelClient')
 "
+
+echo ""
+echo "==> 修 .pth (setuptools compat 模式 bug 绕过)"
+PTH_FILE="$(python -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)/__editable__.lerobot_robot_massage-0.1.0.pth"
+if [[ -f "$PTH_FILE" ]]; then
+    echo "    修改前: $(cat "$PTH_FILE")"
+    echo "$ARM_DIR" > "$PTH_FILE"
+    echo "    修改后: $(cat "$PTH_FILE")"
+else
+    echo "    (跳过) $PTH_FILE 不存在 (pip install 可能没跑)"
+fi
