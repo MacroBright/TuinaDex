@@ -1,0 +1,72 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ─── Test/Coverage ───
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache/
+
+# ─── Type/MyPy ───
+.mypy_cache/
+.pyre/
+
+# ─── Jupyter ───
+.ipynb_checkpoints/
+
+# ─── AI 模型权重与数据集 (不入库, 用 LFS / 外部存储) ───
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.h5
+checkpoints/
+datasets/
+outputs/
+logs/
+*.log
+
+# ─── MLflow / Weights & Biases ───
+mlruns/
+wandb/
+
+# ─── Docker ───
+.docker/
+docker-compose.override.yml
+
+# ─── IDE / 编辑器 ───
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── 临时与缓存 ───
+*.tmp
+*.bak
+*~
+.turin_cache/
+
+# ─── Submodule 产物 (submodule 自身有 .gitignore) ───
+# submodule 自己管自己的 ignore
+
+# ─── Python 视觉/手柄运行时产物 (从 Arm/Hand 仓库复制过来) ───
+python/gesture_mapping/models/         # MediaPipe 模型
+python/gesture_mapping/camera_pref.json
+python/gesture_mapping/joint_gain.json
+python/gesture_mapping/motor_limits.json
+python/gesture_mapping/calibration_3d.json

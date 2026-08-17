@@ -1,0 +1,6 @@
+[submodule "Arm-robot_VLA"]
+	path = Arm-robot_VLA
+	url = https://github.com/MacroBright/Arm-robot_VLA.git
+[submodule "Leap_Hand"]
+	path = Leap_Hand
+	url = https://github.com/MacroBright/Leap_hand.git
