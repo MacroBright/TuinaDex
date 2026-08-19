@@ -1,0 +1,23 @@
+name: arm_vla
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - accelerate==1.14.0
+      - datasets==4.8.5
+      - diffusers==0.35.2
+      - lerobot==0.4.4
+      - mujoco==3.10.0
+      - opencv-python-headless==4.12.0.88
+      - pygame==2.6.1
+      - pynput==1.8.2
+      - pyserial==3.5
+      - pytest==8.4.2
+      - python-can==4.6.1
+      - torch==2.10.0
+      - torchcodec==0.10.0
+      - torchvision==0.25.0
+      - wandb==0.24.2
+      - xxhash==3.8.1

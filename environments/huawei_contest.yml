@@ -1,0 +1,17 @@
+name: huawei_contest
+channels:
+  - defaults
+dependencies:
+  - python=3.14
+  - pip
+  - pip:
+      - dynamixel-sdk==4.0.5
+      - ipykernel==7.3.0
+      - jupyterlab==4.5.5
+      - mediapipe==1.0.0
+      - numpy==2.5.1
+      - opencv-contrib-python==5.0.0.93
+      - pyrealsense2==2.58.3.10794
+      - pyserial==3.5
+      - pytest==9.1.1
+      - sounddevice==0.5.5
