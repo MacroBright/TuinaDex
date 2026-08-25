@@ -62,6 +62,7 @@ Thumbs.db
 *.bak
 *~
 .turin_cache/
+.worktrees/
 
 # ─── Submodule 产物 (submodule 自身有 .gitignore) ───
 # submodule 自己管自己的 ignore
