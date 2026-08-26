@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +65,29 @@ def test_reopen_resumes_with_next_id(tmp_path: Path, image: np.ndarray) -> None:
 
     assert saved.pair_id == 2
     assert saved.left_path.name == "pair_0002_left.png"
+
+
+def test_concurrent_saves_allocate_unique_monotonic_ids_and_reopen(
+    tmp_path: Path, image: np.ndarray
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        saved = list(executor.map(lambda _: store.save_pair(image, image, {}), range(12)))
+
+    assert sorted(pair.pair_id for pair in saved) == list(range(1, 13))
+    assert len(store.manifest_path.read_text(encoding="utf-8").splitlines()) == 12
+    assert [pair.pair_id for pair in SessionStore.open(store.session_dir).active_pairs()] == list(
+        range(1, 13)
+    )
+
+
+def test_interleaved_store_instances_refresh_the_next_id(tmp_path: Path, image: np.ndarray) -> None:
+    first = SessionStore.create(tmp_path, "run")
+    second = SessionStore.open(first.session_dir)
+
+    assert first.save_pair(image, image, {}).pair_id == 1
+    assert second.save_pair(image, image, {}).pair_id == 2
 
 
 def test_reject_last_moves_pair_logs_event_and_removes_it_from_active(
@@ -153,6 +177,51 @@ def test_open_refuses_missing_one_active_image(tmp_path: Path) -> None:
     (store.pairs_dir / "pair_0001_left.png").touch()
 
     with pytest.raises(SessionError, match=r"pair 1.*missing|missing.*pair 1"):
+        SessionStore.open(store.session_dir)
+
+
+@pytest.mark.parametrize("component", ["session", "pairs", "rejected", "results", "manifest", "lock"])
+def test_open_refuses_symlinked_session_component(tmp_path: Path, component: str) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    component_paths = {
+        "pairs": store.pairs_dir,
+        "rejected": store.rejected_dir,
+        "results": store.results_dir,
+        "manifest": store.manifest_path,
+        "lock": store.session_dir / ".session.lock",
+    }
+    path = store.session_dir if component == "session" else component_paths[component]
+    if component == "lock" and not path.exists():
+        pytest.fail("session lock was not created")
+    moved = tmp_path / f"{component}-backing"
+    path.rename(moved)
+
+    try:
+        path.symlink_to(moved, target_is_directory=component in {"session", "pairs", "rejected", "results"})
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"platform cannot create symlinks: {exc}")
+
+    with pytest.raises(SessionError, match="symlink"):
+        SessionStore.open(store.session_dir)
+
+
+@pytest.mark.parametrize("location", ["pairs", "rejected"])
+def test_open_refuses_symlinked_expected_image_outside_session(
+    tmp_path: Path, image: np.ndarray, location: str
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    saved = store.save_pair(image, image, {})
+    if location == "rejected":
+        saved = store.reject_last("bad")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"outside")
+    saved.left_path.unlink()
+    try:
+        saved.left_path.symlink_to(outside)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"platform cannot create symlinks: {exc}")
+
+    with pytest.raises(SessionError, match="symlink"):
         SessionStore.open(store.session_dir)
 
 
@@ -254,6 +323,106 @@ def test_unpaired_surrogate_metadata_is_rejected_before_image_io(
     assert calls == 0
     assert list(store.pairs_dir.iterdir()) == []
     assert store.manifest_path.read_text() == ""
+
+
+def test_unpaired_surrogate_reject_reason_is_rejected_before_files_move(
+    tmp_path: Path, image: np.ndarray
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    saved = store.save_pair(image, image, {})
+    manifest_before = store.manifest_path.read_text(encoding="utf-8")
+
+    with pytest.raises(SessionError, match="reason"):
+        store.reject_last("\ud800")
+
+    assert saved.left_path.is_file()
+    assert saved.right_path.is_file()
+    assert not (store.session_dir / ".reject-transaction.json").exists()
+    assert store.manifest_path.read_text(encoding="utf-8") == manifest_before
+
+
+@pytest.mark.parametrize(
+    "metadata_json",
+    [r'{"value":1e100000}', r'{"bad":"\ud800"}'],
+)
+def test_open_rejects_nonfinite_or_invalid_utf8_capture_metadata(
+    tmp_path: Path, metadata_json: str
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    store.manifest_path.write_text(
+        f'{{"action":"capture","pair_id":1,"metadata":{metadata_json}}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SessionError, match=r"line 1.*pair 1.*metadata"):
+        SessionStore.open(store.session_dir)
+
+
+def test_open_recovers_partial_rejection_after_second_image_move_fails(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    saved = store.save_pair(image, image, {})
+    original_replace = Path.replace
+
+    def fail_right_move(path: Path, target: Path) -> Path:
+        if path == saved.right_path and target == store.rejected_dir / "pair_0001_right.png":
+            raise OSError("injected second move failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_right_move)
+
+    with pytest.raises(SessionError, match="reject pair 1"):
+        store.reject_last("bad")
+
+    marker = store.session_dir / ".reject-transaction.json"
+    assert marker.is_file()
+    assert (store.rejected_dir / "pair_0001_left.png").is_file()
+    assert saved.right_path.is_file()
+    monkeypatch.setattr(Path, "replace", original_replace)
+
+    reopened = SessionStore.open(store.session_dir)
+
+    assert reopened.active_pairs() == []
+    assert not marker.exists()
+    assert [json.loads(line)["action"] for line in reopened.manifest_path.read_text().splitlines()] == [
+        "capture",
+        "reject",
+    ]
+
+
+def test_open_finishes_rejection_after_manifest_append_writes_then_fails(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    store.save_pair(image, image, {})
+    original_append = store._append_event
+
+    def append_then_fail(event: dict[str, object]) -> None:
+        original_append(event)
+        raise SessionError("injected manifest fsync failure")
+
+    monkeypatch.setattr(store, "_append_event", append_then_fail)
+
+    with pytest.raises(SessionError, match="manifest fsync"):
+        store.reject_last("bad")
+
+    marker = store.session_dir / ".reject-transaction.json"
+    assert marker.is_file()
+    assert [json.loads(line)["action"] for line in store.manifest_path.read_text().splitlines()] == [
+        "capture",
+        "reject",
+    ]
+    monkeypatch.setattr(store, "_append_event", original_append)
+
+    reopened = SessionStore.open(store.session_dir)
+
+    assert reopened.active_pairs() == []
+    assert not marker.exists()
+    assert [json.loads(line)["action"] for line in reopened.manifest_path.read_text().splitlines()] == [
+        "capture",
+        "reject",
+    ]
 
 
 def test_metadata_is_defensively_copied_on_save_and_read(tmp_path: Path, image: np.ndarray) -> None:
