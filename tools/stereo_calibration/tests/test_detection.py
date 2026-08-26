@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from tools.stereo_calibration.config import CheckerboardConfig, QualityConfig
+from tools.stereo_calibration import detection
 from tools.stereo_calibration.detection import (
     detect_checkerboard,
     make_object_points,
@@ -108,3 +109,88 @@ def test_absent_checkerboard_reports_expected_corner_count() -> None:
     assert not result.found
     assert result.corner_count == 0
     assert result.reasons == ("expected 54 corners",)
+
+
+def test_overexposed_blank_frame_reports_detection_and_exposure_rejections() -> None:
+    frame = np.full((960, 1280, 3), 255, dtype=np.uint8)
+    result = detect_checkerboard(frame, BOARD, QUALITY)
+
+    assert not result.found
+    assert not result.saveable
+    assert result.reasons == (
+        "expected 54 corners",
+        "image is severely overexposed",
+    )
+
+
+@pytest.mark.parametrize("maximum", [90.0, 89.9])
+def test_checkerboard_at_or_rounding_to_the_right_bottom_margin_fails(
+    monkeypatch: pytest.MonkeyPatch, maximum: float
+) -> None:
+    corners = np.full((54, 1, 2), 20.0, dtype=np.float32)
+    corners[-1, 0] = (maximum, maximum)
+    monkeypatch.setattr(
+        detection.cv2,
+        "findChessboardCornersSB",
+        lambda *_args: (True, corners),
+    )
+    quality = QualityConfig(
+        edge_margin_px=10,
+        min_laplacian_variance=0.0,
+        max_saturated_fraction=1.0,
+    )
+
+    result = detect_checkerboard(np.full((100, 100, 3), 127, dtype=np.uint8), BOARD, quality)
+
+    assert not result.border_ok
+    assert result.reasons == ("checkerboard is too close to an image edge",)
+
+
+def test_detected_corners_are_float32_copied_and_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector_corners = np.full((54, 1, 2), 20.0, dtype=np.float64)
+    monkeypatch.setattr(
+        detection.cv2,
+        "findChessboardCornersSB",
+        lambda *_args: (True, detector_corners),
+    )
+    quality = QualityConfig(
+        edge_margin_px=10,
+        min_laplacian_variance=0.0,
+        max_saturated_fraction=1.0,
+    )
+
+    result = detect_checkerboard(np.full((100, 100, 3), 127, dtype=np.uint8), BOARD, quality)
+
+    assert result.corners is not None
+    assert result.corners is not detector_corners
+    assert result.corners.shape == detector_corners.shape
+    assert result.corners.dtype == np.float32
+    assert not result.corners.flags.writeable
+    with pytest.raises(ValueError):
+        result.corners[0, 0, 0] = 1.0
+
+
+def test_out_of_range_corners_produce_empty_roi_blur_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corners = np.full((54, 1, 2), 100.0, dtype=np.float32)
+    monkeypatch.setattr(
+        detection.cv2,
+        "findChessboardCornersSB",
+        lambda *_args: (True, corners),
+    )
+    quality = QualityConfig(
+        edge_margin_px=0,
+        min_laplacian_variance=1.0,
+        max_saturated_fraction=1.0,
+    )
+
+    result = detect_checkerboard(np.full((20, 20, 3), 127, dtype=np.uint8), BOARD, quality)
+
+    assert result.sharpness == 0.0
+    assert result.reasons == (
+        "checkerboard is too close to an image edge",
+        "checkerboard is too blurry",
+    )

@@ -56,13 +56,21 @@ def detect_checkerboard(
     """Detect a calibration checkerboard and report whether the frame is saveable."""
     grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     saturated_fraction = float(np.mean(grayscale >= 250))
-    found, corners = cv2.findChessboardCornersSB(
+    found, detected_corners = cv2.findChessboardCornersSB(
         grayscale,
         board.pattern_size,
         cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE,
     )
 
-    if not found or corners is None or len(corners) != board.corner_count:
+    overexposed = saturated_fraction > quality.max_saturated_fraction
+    if (
+        not found
+        or detected_corners is None
+        or len(detected_corners) != board.corner_count
+    ):
+        reasons = [f"expected {board.corner_count} corners"]
+        if overexposed:
+            reasons.append("image is severely overexposed")
         return DetectionResult(
             found=False,
             corners=None,
@@ -70,32 +78,38 @@ def detect_checkerboard(
             saturated_fraction=saturated_fraction,
             border_ok=False,
             saveable=False,
-            reasons=(f"expected {board.corner_count} corners",),
+            reasons=tuple(reasons),
         )
 
+    corners = np.array(detected_corners, dtype=np.float32, copy=True)
+    corners.setflags(write=False)
     coordinates = corners.reshape(-1, 2)
-    min_x, min_y = coordinates.min(axis=0)
-    max_x, max_y = coordinates.max(axis=0)
+    min_x, min_y = np.floor(coordinates.min(axis=0)).astype(int)
+    max_x, max_y = np.ceil(coordinates.max(axis=0)).astype(int)
     height, width = grayscale.shape
     border_ok = bool(
         min_x >= quality.edge_margin_px
         and min_y >= quality.edge_margin_px
-        and max_x <= width - quality.edge_margin_px
-        and max_y <= height - quality.edge_margin_px
+        and max_x < width - quality.edge_margin_px
+        and max_y < height - quality.edge_margin_px
     )
 
+    roi_left = min(max(min_x, 0), width)
+    roi_right = min(max(max_x + 1, 0), width)
+    roi_top = min(max(min_y, 0), height)
+    roi_bottom = min(max(max_y + 1, 0), height)
     roi = grayscale[
-        int(np.floor(min_y)) : int(np.ceil(max_y)) + 1,
-        int(np.floor(min_x)) : int(np.ceil(max_x)) + 1,
+        roi_top:roi_bottom,
+        roi_left:roi_right,
     ]
-    sharpness = float(cv2.Laplacian(roi, cv2.CV_64F).var())
+    sharpness = 0.0 if roi.size == 0 else float(cv2.Laplacian(roi, cv2.CV_64F).var())
 
     reasons: list[str] = []
     if not border_ok:
         reasons.append("checkerboard is too close to an image edge")
     if sharpness < quality.min_laplacian_variance:
         reasons.append("checkerboard is too blurry")
-    if saturated_fraction > quality.max_saturated_fraction:
+    if overexposed:
         reasons.append("image is severely overexposed")
 
     return DetectionResult(
