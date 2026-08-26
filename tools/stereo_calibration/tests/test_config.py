@@ -2,6 +2,7 @@
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -199,6 +200,14 @@ def test_controls_are_copied_and_immutable(tmp_path: Path) -> None:
     assert config.capture.v4l2_controls["gain"] == 32
     with pytest.raises(TypeError):
         config.capture.v4l2_controls["gain"] = 99
+
+
+def test_validate_rejects_empty_camera_name_on_direct_construction(tmp_path: Path) -> None:
+    config = AppConfig.from_mapping(valid_payload(tmp_path))
+    invalid = replace(config, left=replace(config.left, name=""))
+
+    with pytest.raises(ConfigError, match="camera name"):
+        invalid.validate()
 
 
 def test_checkerboard_corner_count_is_54(tmp_path: Path) -> None:

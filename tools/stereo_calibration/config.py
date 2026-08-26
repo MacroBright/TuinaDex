@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from math import isfinite
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -251,7 +250,8 @@ class AppConfig:
         if self.left.device == self.right.device:
             raise ConfigError("left and right cameras must use different devices")
         for camera in (self.left, self.right):
-            _require_string(camera.name, "camera name")
+            if not _require_string(camera.name, "camera name"):
+                raise ConfigError("camera name must not be empty")
             _require_device_path(camera.device, "camera device")
             rotation = _require_integer(camera.rotation_degrees, "camera rotation")
             if rotation not in (0, 180):
