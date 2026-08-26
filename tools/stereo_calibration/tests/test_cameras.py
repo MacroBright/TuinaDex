@@ -188,8 +188,8 @@ def test_apply_controls_sets_modes_first_and_verifies_exact_values(
         calls.append((argv, kwargs))
         output = "" if "--set-ctrl" in argv[2] else (
             "white_balance_automatic: 0\n"
-            "gain: 12\n"
-            "auto_exposure: 1\n"
+            "gain: +12\n"
+            "auto_exposure: 1 (Manual Mode)   \n"
             "exposure_time_absolute: 80\n"
         )
         return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
@@ -231,6 +231,8 @@ def test_apply_controls_sets_modes_first_and_verifies_exact_values(
         "gain: 9\n",
         "gain: 12\ngain: 12\n",
         "gain: twelve\n",
+        "gain: Manual 12\n",
+        "gain: 12 junk\n",
         "unrequested: 12\n",
         "",
     ],
@@ -412,16 +414,23 @@ def test_read_grabs_before_retrieve_normalizes_and_owns_frames(
     pair.close()
 
 
-def test_read_normalizes_each_frame_immediately_after_its_retrieval(
+def test_read_retrieves_and_timestamps_both_frames_before_normalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pair, _, _, log = configured_pair()
+    timestamps = iter([100, 120])
 
     def tracked_normalize(frame: np.ndarray, rotation: int) -> np.ndarray:
         log.append(("normalize", rotation))
         return frame
 
+    def tracked_timestamp() -> int:
+        value = next(timestamps)
+        log.append(("timestamp", value))
+        return value
+
     monkeypatch.setattr(cameras, "normalize_frame", tracked_normalize)
+    monkeypatch.setattr(cameras, "monotonic_ns", tracked_timestamp)
     pair.open()
     log.clear()
     pair.read()
@@ -429,8 +438,10 @@ def test_read_normalizes_each_frame_immediately_after_its_retrieval(
         (LEFT_DEVICE, "grab"),
         (RIGHT_DEVICE, "grab"),
         (LEFT_DEVICE, "retrieve"),
-        ("normalize", 0),
+        ("timestamp", 100),
         (RIGHT_DEVICE, "retrieve"),
+        ("timestamp", 120),
+        ("normalize", 0),
         ("normalize", 180),
     ]
     pair.close()
@@ -865,10 +876,14 @@ def test_worker_rejects_double_start_and_reports_unstoppable_thread() -> None:
     with pytest.raises(CameraError, match="start"):
         worker.start()
     original_join = worker._thread.join
+    original_is_alive = worker._thread.is_alive
     worker._thread.join = lambda timeout=None: None
     worker._thread.is_alive = lambda: True
     with pytest.raises(CameraError, match="2"):
         worker.stop()
+    assert source.close_count == 0
     worker._thread.join = original_join
+    worker._thread.is_alive = original_is_alive
     allow.set()
     worker._thread.join(timeout=1.0)
+    assert source.close_count == 1

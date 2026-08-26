@@ -40,13 +40,17 @@ class PairSource(Protocol):
 
     def open(self) -> None: ...
 
-    def read(self) -> FramePair: ...
+    def read(self) -> FramePair:
+        """Return a pair without blocking beyond the worker's stop budget."""
+        ...
 
     def close(self) -> None: ...
 
 
 _CONTROL_NAME = re.compile(r"^[A-Za-z0-9_]+$")
-_CONTROL_OUTPUT = re.compile(r"^\s*([A-Za-z0-9_]+)\s*:\s*(-?\d+)\s*$")
+_CONTROL_OUTPUT = re.compile(
+    r"^\s*([A-Za-z0-9_]+)\s*:\s*([+-]?\d+)(?:\s+\([^)]*\))?\s*$"
+)
 _MODE_CONTROLS = ("auto_exposure", "white_balance_automatic")
 
 
@@ -346,11 +350,11 @@ class OpenCVCameraPair:
             raise CameraError("right camera grab failed")
 
         left_raw, left_timestamp = self._retrieve(self._left, "left")
-        left = self._normalize(left_raw, self._config.left.rotation_degrees, "left")
         right_raw, right_timestamp = self._retrieve(self._right, "right")
-        right = self._normalize(right_raw, self._config.right.rotation_degrees, "right")
         if right_timestamp < left_timestamp:
             raise CameraError("camera retrieval timestamps are not monotonic")
+        left = self._normalize(left_raw, self._config.left.rotation_degrees, "left")
+        right = self._normalize(right_raw, self._config.right.rotation_degrees, "right")
         return FramePair(
             left=left,
             right=right,
