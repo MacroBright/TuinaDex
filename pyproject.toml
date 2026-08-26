@@ -115,7 +115,7 @@ select = ["E", "F", "W", "I"]
 ignore = ["E501"]  # 长行（docstring 中允许）
 
 [tool.pytest.ini_options]
-testpaths = ["apps", "packages"]
+testpaths = ["apps", "packages", "tools"]
 addopts = "-ra --strict-markers"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

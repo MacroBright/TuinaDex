@@ -73,3 +73,6 @@ python/gesture_mapping/camera_pref.json
 python/gesture_mapping/joint_gain.json
 python/gesture_mapping/motor_limits.json
 python/gesture_mapping/calibration_3d.json
+
+data/stereo_calibration/
+.superpowers/
