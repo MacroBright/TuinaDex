@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -26,6 +27,13 @@ def _required(data: Mapping[str, Any], key: str, label: str) -> Any:
         raise ConfigError(f"{label} is missing required field {key!r}") from exc
 
 
+def _rotation_value(value: Any) -> int:
+    """Parse a rotation without truncating fractional or boolean values."""
+    if isinstance(value, bool) or not isinstance(value, Real) or value not in (0, 180):
+        raise ConfigError("camera rotation must be numeric and exactly 0 or 180 degrees")
+    return int(value)
+
+
 @dataclass(frozen=True)
 class CameraConfig:
     """A logical camera selected by a stable V4L2 by-path identifier."""
@@ -41,7 +49,9 @@ class CameraConfig:
             camera = cls(
                 name=str(_required(source, "name", "camera")),
                 device=str(_required(source, "device", "camera")),
-                rotation_degrees=int(_required(source, "rotation_degrees", "camera")),
+                rotation_degrees=_rotation_value(
+                    _required(source, "rotation_degrees", "camera")
+                ),
             )
         except ConfigError:
             raise
@@ -206,7 +216,11 @@ class AppConfig:
         for camera in (self.left, self.right):
             if not camera.device.startswith("/dev/v4l/by-path/"):
                 raise ConfigError("camera device must use /dev/v4l/by-path")
-            if camera.rotation_degrees not in (0, 180):
+            if (
+                isinstance(camera.rotation_degrees, bool)
+                or not isinstance(camera.rotation_degrees, Real)
+                or camera.rotation_degrees not in (0, 180)
+            ):
                 raise ConfigError("camera rotation must be 0 or 180 degrees")
 
         if self.capture.width <= 0 or self.capture.height <= 0 or self.capture.fps <= 0:

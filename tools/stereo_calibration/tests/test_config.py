@@ -72,6 +72,14 @@ def test_right_camera_rotation_is_180(tmp_path: Path) -> None:
     assert config.right.rotation_degrees == 180
 
 
+def test_fractional_camera_rotation_is_rejected(tmp_path: Path) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping["right"]["rotation_degrees"] = 180.9
+
+    with pytest.raises(ConfigError, match="rotation"):
+        AppConfig.from_mapping(mapping)
+
+
 def test_checkerboard_corner_count_is_54(tmp_path: Path) -> None:
     config = AppConfig.from_mapping(valid_mapping(tmp_path))
 
