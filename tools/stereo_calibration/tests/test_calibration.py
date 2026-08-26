@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -155,9 +158,9 @@ def test_load_session_skips_bad_metadata_with_pair_specific_diagnostic(
 ) -> None:
     store = SessionStore.create(tmp_path, "load")
     observations = synthetic_stereo_observations()
-    image = np.full((48, 64, 3), 80, dtype=np.uint8)
-    first = store.save_pair(image, image, _pair_metadata(observations[0], (64, 48)))
-    malformed = _pair_metadata(observations[1], (64, 48))
+    image = np.full((960, 1280, 3), 80, dtype=np.uint8)
+    first = store.save_pair(image, image, _pair_metadata(observations[0], (1280, 960)))
+    malformed = _pair_metadata(observations[1], (1280, 960))
     malformed["left_corners"] = malformed["left_corners"][:-1]
     second = store.save_pair(image, image, malformed)
 
@@ -179,9 +182,9 @@ def test_load_session_checks_saved_image_dimensions_and_continues(
 ) -> None:
     store = SessionStore.create(tmp_path, "dimensions")
     observation = synthetic_stereo_observations()[0]
-    left = np.zeros((48, 64, 3), dtype=np.uint8)
-    right = np.zeros((47, 64, 3), dtype=np.uint8)
-    saved = store.save_pair(left, right, _pair_metadata(observation, (64, 48)))
+    left = np.zeros((960, 1280, 3), dtype=np.uint8)
+    right = np.zeros((959, 1280, 3), dtype=np.uint8)
+    saved = store.save_pair(left, right, _pair_metadata(observation, (1280, 960)))
 
     loaded, diagnostics = load_session_observations(store, SYNTHETIC_BOARD)
 
@@ -189,7 +192,7 @@ def test_load_session_checks_saved_image_dimensions_and_continues(
     assert diagnostics == [
         {
             "pair_id": saved.pair_id,
-            "reason": "left/right captured image dimensions differ: 64x48 versus 64x47",
+            "reason": "left/right captured image dimensions differ: 1280x960 versus 1280x959",
         }
     ]
 
@@ -199,8 +202,8 @@ def test_load_session_requires_configured_image_dimensions_in_metadata(
 ) -> None:
     store = SessionStore.create(tmp_path, "missing-dimensions")
     observation = synthetic_stereo_observations()[0]
-    image = np.zeros((48, 64, 3), dtype=np.uint8)
-    metadata = _pair_metadata(observation, (64, 48))
+    image = np.zeros((960, 1280, 3), dtype=np.uint8)
+    metadata = _pair_metadata(observation, (1280, 960))
     del metadata["image_size"]
     saved = store.save_pair(image, image, metadata)
 
@@ -209,6 +212,59 @@ def test_load_session_requires_configured_image_dimensions_in_metadata(
     assert loaded == []
     assert diagnostics == [
         {"pair_id": saved.pair_id, "reason": "image_size metadata is missing"}
+    ]
+
+
+def _bounded_metadata(width: int, height: int) -> dict:
+    xs = np.linspace(2.0, width - 3.0, SYNTHETIC_BOARD.columns, dtype=np.float32)
+    ys = np.linspace(2.0, height - 3.0, SYNTHETIC_BOARD.rows, dtype=np.float32)
+    corners = np.array([(x, y) for y in ys for x in xs], dtype=np.float32)
+    return {
+        "left_corners": corners.tolist(),
+        "right_corners": corners.tolist(),
+        "image_size": [width, height],
+    }
+
+
+def test_load_session_rejects_cross_pair_size_mismatch_without_poisoning_later_pair(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore.create(tmp_path, "cross-pair-size")
+    small = np.zeros((48, 64, 3), dtype=np.uint8)
+    large = np.zeros((60, 80, 3), dtype=np.uint8)
+    first = store.save_pair(small, small, _bounded_metadata(64, 48))
+    mismatched = store.save_pair(large, large, _bounded_metadata(80, 60))
+    third = store.save_pair(small, small, _bounded_metadata(64, 48))
+
+    observations, diagnostics = load_session_observations(store, SYNTHETIC_BOARD)
+
+    assert [item.pair_id for item in observations] == [first.pair_id, third.pair_id]
+    assert diagnostics == [
+        {
+            "pair_id": mismatched.pair_id,
+            "reason": "captured image dimensions 80x60 differ from session dimensions 64x48",
+        }
+    ]
+
+
+def test_load_session_rejects_out_of_bounds_corners_and_continues(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore.create(tmp_path, "corner-bounds")
+    image = np.zeros((48, 64, 3), dtype=np.uint8)
+    first_metadata = _bounded_metadata(64, 48)
+    first_metadata["right_corners"][0][0] = 64.0
+    invalid = store.save_pair(image, image, first_metadata)
+    valid = store.save_pair(image, image, _bounded_metadata(64, 48))
+
+    observations, diagnostics = load_session_observations(store, SYNTHETIC_BOARD)
+
+    assert [item.pair_id for item in observations] == [valid.pair_id]
+    assert diagnostics == [
+        {
+            "pair_id": invalid.pair_id,
+            "reason": "right_corners contains coordinates outside image bounds 64x48",
+        }
     ]
 
 
@@ -349,7 +405,107 @@ def test_write_run_round_trips_npz_yaml_json_markdown_and_previews(
     assert len(previews) >= 3
     preview = cv2.imread(str(previews[0]))
     assert preview is not None
+    assert preview.shape == (48, 128, 3)
     assert np.any(preview[40, :, 1] > 150)
+
+
+def test_nan_matrix_is_rejected_before_any_artifact_or_lock_is_created(
+    tmp_path: Path,
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "nan-matrix")
+    sources = _source_pairs(store)
+    matrix = _artifact_result().left_camera_matrix.copy()
+    matrix[0, 0] = np.nan
+    result = replace(_artifact_result(), left_camera_matrix=matrix)
+
+    with pytest.raises(ValueError, match="left_camera_matrix.*finite"):
+        write_calibration_run(store, result, config, sources)
+
+    assert list(store.results_dir.iterdir()) == []
+
+
+def test_result_and_source_ids_must_match_before_artifact_creation(tmp_path: Path) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "id-mismatch")
+    sources = _source_pairs(store, (1, 2, 4))
+
+    with pytest.raises(ValueError, match="source pair IDs must exactly match result pair IDs"):
+        write_calibration_run(store, _artifact_result(), config, sources)
+
+    assert list(store.results_dir.iterdir()) == []
+
+
+def test_pair_count_must_match_per_pair_errors_before_artifact_creation(
+    tmp_path: Path,
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "count-mismatch")
+    result = replace(_artifact_result(), pair_count=4)
+
+    with pytest.raises(ValueError, match="pair_count must equal the per-pair error count"):
+        write_calibration_run(store, result, config, _source_pairs(store))
+
+    assert list(store.results_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "message"),
+    [(float("nan"), "finite"), (-0.1, "non-negative")],
+)
+def test_invalid_individual_reprojection_error_is_rejected_before_artifacts(
+    tmp_path: Path, bad_value: float, message: str
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "bad-error")
+    errors = {key: dict(value) for key, value in _artifact_result().per_pair_errors.items()}
+    errors[2]["left_rmse_px"] = bad_value
+    result = replace(_artifact_result(), per_pair_errors=errors)
+
+    with pytest.raises(ValueError, match=message):
+        write_calibration_run(store, result, config, _source_pairs(store))
+
+    assert list(store.results_dir.iterdir()) == []
+
+
+def test_inconsistent_supplied_combined_error_is_rejected(tmp_path: Path) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "bad-combined")
+    errors = {key: dict(value) for key, value in _artifact_result().per_pair_errors.items()}
+    errors[2]["combined_rmse_px"] = 0.9
+    result = replace(_artifact_result(), per_pair_errors=errors)
+
+    with pytest.raises(ValueError, match="combined_rmse_px is inconsistent"):
+        write_calibration_run(store, result, config, _source_pairs(store))
+
+    assert list(store.results_dir.iterdir()) == []
+
+
+def test_map_shape_must_match_config_before_artifact_creation(tmp_path: Path) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "bad-map")
+    result = replace(
+        _artifact_result(), map_right_y=np.zeros((47, 64), dtype=np.float32)
+    )
+
+    with pytest.raises(ValueError, match=r"map_right_y must have shape \(48, 64\)"):
+        write_calibration_run(store, result, config, _source_pairs(store))
+
+    assert list(store.results_dir.iterdir()) == []
+
+
+def test_preview_source_dimensions_must_match_config_before_staging(tmp_path: Path) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "bad-preview-size")
+    sources = _source_pairs(store)
+    wrong = np.zeros((48, 63, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(sources[1].left_path), wrong)
+    assert cv2.imwrite(str(sources[1].right_path), wrong)
+
+    with pytest.raises(ValueError, match="source pair 2 image dimensions 63x48"):
+        write_calibration_run(store, _artifact_result(), config, sources)
+
+    assert list(store.results_dir.iterdir()) == []
 
 
 def test_outlier_is_reported_without_deleting_or_excluding_source_pair(
@@ -432,10 +588,62 @@ def test_two_runs_use_distinct_directories_without_overwriting(tmp_path: Path) -
     assert (second / "report.json").is_file()
 
 
+def test_concurrent_writers_with_same_timestamp_publish_distinct_intact_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "concurrent-runs")
+    second_store = SessionStore.open(store.session_dir)
+    result = _artifact_result()
+    sources = _source_pairs(store)
+    frozen = datetime(2026, 8, 26, 12, 34, 56, 123456)
+    monkeypatch.setattr(calibration, "_current_datetime", lambda: frozen)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(write_calibration_run, selected, result, config, sources)
+            for selected in (store, second_store)
+        ]
+        run_dirs = [future.result() for future in futures]
+
+    assert len(set(run_dirs)) == 2
+    assert {path.name for path in run_dirs} == {
+        "20260826-123456123456",
+        "20260826-123456123457",
+    }
+    for path in run_dirs:
+        report = json.loads((path / "report.json").read_text(encoding="utf-8"))
+        assert report["source_pair_ids"] == [1, 2, 3]
+        assert (path / "stereo_calibration.npz").is_file()
+
+
+def test_reopen_validation_rejects_wrong_preview_shape_without_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "bad-reopen")
+    sources = _source_pairs(store)
+    original = calibration._write_rectified_previews
+
+    def corrupt_preview(*args: object, **kwargs: object) -> None:
+        original(*args, **kwargs)
+        staging_dir = args[0]
+        preview_path = sorted((staging_dir / "previews").glob("*.png"))[0]
+        assert cv2.imwrite(str(preview_path), np.zeros((2, 2, 3), dtype=np.uint8))
+
+    monkeypatch.setattr(calibration, "_write_rectified_previews", corrupt_preview)
+
+    with pytest.raises(ValueError, match="preview.*unexpected shape"):
+        write_calibration_run(store, _artifact_result(), config, sources)
+
+    assert [path for path in store.results_dir.iterdir() if path.is_dir()] == []
+
+
 def test_fewer_than_three_readable_pairs_fails_before_publishing(tmp_path: Path) -> None:
     config = _artifact_config(tmp_path)
     store = SessionStore.create(tmp_path, "too-few")
-    sources = _source_pairs(store, (1, 2))
+    sources = _source_pairs(store)
+    sources[2].right_path.unlink()
 
     with pytest.raises(ValueError, match="at least 3 readable source pairs"):
         write_calibration_run(store, _artifact_result(), config, sources)
@@ -457,4 +665,41 @@ def test_artifact_failure_removes_staging_and_leaves_no_final_run(
     with pytest.raises(OSError, match="injected YAML failure"):
         write_calibration_run(store, _artifact_result(), config, sources)
 
-    assert list(store.results_dir.iterdir()) == []
+    assert not [path for path in store.results_dir.iterdir() if path.is_dir()]
+
+
+def test_cleanup_failure_reports_primary_and_cleanup_and_stale_stage_is_not_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "cleanup-failure")
+    sources = _source_pairs(store)
+    original_yaml = calibration._write_yaml_artifact
+    original_cleanup = calibration._cleanup_staging
+
+    def fail_yaml(*args: object, **kwargs: object) -> None:
+        raise OSError("primary artifact failure")
+
+    def fail_cleanup(path: Path) -> None:
+        raise OSError("staging cleanup failure")
+
+    monkeypatch.setattr(calibration, "_write_yaml_artifact", fail_yaml)
+    monkeypatch.setattr(calibration, "_cleanup_staging", fail_cleanup)
+    with pytest.raises(RuntimeError) as captured:
+        write_calibration_run(store, _artifact_result(), config, sources)
+
+    assert "primary artifact failure" in str(captured.value)
+    assert "staging cleanup failure" in str(captured.value)
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "primary artifact failure" in str(captured.value.__cause__)
+    stale = [path for path in store.results_dir.iterdir() if path.is_dir()]
+    assert len(stale) == 1
+    assert stale[0].name.startswith(".") and stale[0].name.endswith(".tmp")
+
+    monkeypatch.setattr(calibration, "_write_yaml_artifact", original_yaml)
+    monkeypatch.setattr(calibration, "_cleanup_staging", original_cleanup)
+    run_dir = write_calibration_run(store, _artifact_result(), config, sources)
+
+    assert re.fullmatch(r"\d{8}-\d{12}", run_dir.name)
+    assert json.loads((run_dir / "report.json").read_text(encoding="utf-8"))["status"] == "pass"
+    assert stale[0].is_dir()

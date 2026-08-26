@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import math
 import os
 import shutil
+import stat
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import cv2
 import numpy as np
@@ -19,6 +24,11 @@ from numpy.typing import NDArray
 from .config import AppConfig, CheckerboardConfig
 from .detection import make_object_points
 from .session import SavedPair, SessionStore
+
+
+_RESULT_LOCK_FILENAME = ".calibration.lock"
+_RESULT_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_RESULT_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -236,6 +246,7 @@ def load_session_observations(
     """Return valid observations plus explicit, pair-specific skip diagnostics."""
     observations: list[StereoObservation] = []
     diagnostics: list[dict[str, str | int]] = []
+    session_image_size: tuple[int, int] | None = None
     for saved in sorted(session.active_pairs(), key=lambda pair: pair.pair_id):
         try:
             left_image = _read_saved_image(saved.left_path, "left image")
@@ -262,6 +273,14 @@ def load_session_observations(
 
             left_corners = _metadata_corners(saved, "left_corners", board.corner_count)
             right_corners = _metadata_corners(saved, "right_corners", board.corner_count)
+            _require_corners_in_bounds(left_corners, left_size, "left_corners")
+            _require_corners_in_bounds(right_corners, right_size, "right_corners")
+            if session_image_size is not None and left_size != session_image_size:
+                raise ValueError(
+                    "captured image dimensions "
+                    f"{left_size[0]}x{left_size[1]} differ from session dimensions "
+                    f"{session_image_size[0]}x{session_image_size[1]}"
+                )
             observations.append(
                 StereoObservation(
                     pair_id=saved.pair_id,
@@ -270,6 +289,8 @@ def load_session_observations(
                     right_corners=right_corners.reshape(-1, 1, 2),
                 )
             )
+            if session_image_size is None:
+                session_image_size = left_size
         except (OSError, TypeError, ValueError) as exc:
             diagnostics.append({"pair_id": saved.pair_id, "reason": str(exc)})
     return observations, diagnostics
@@ -282,43 +303,54 @@ def write_calibration_run(
     source_pairs: list[SavedPair],
 ) -> Path:
     """Atomically publish a never-overwritten timestamped calibration run."""
-    reference = config.baseline_reference_mm
-    if type(reference) not in (int, float) or not math.isfinite(reference) or reference <= 0:
-        raise ValueError("baseline reference must be a positive finite number")
-
-    readable_sources = _load_preview_sources(source_pairs)
+    _validate_calibration_result(result, config)
+    _validate_source_pairs(result, source_pairs)
+    readable_sources = _load_preview_sources(source_pairs, config.capture.image_size)
     if len(readable_sources) < 3:
         raise ValueError("at least 3 readable source pairs are required for previews")
 
-    session.results_dir.mkdir(parents=False, exist_ok=True)
-    final_dir = _next_result_directory(session.results_dir)
-    staging_dir = Path(
-        tempfile.mkdtemp(prefix=f".{final_dir.name}-", suffix=".tmp", dir=session.results_dir)
-    )
-    try:
-        numeric = _numeric_artifacts(result)
-        np.savez_compressed(staging_dir / "stereo_calibration.npz", **numeric)
-        _write_yaml_artifact(
-            staging_dir / "stereo_calibration.yaml",
-            result,
-            config.capture.image_size,
-            [pair.pair_id for pair in source_pairs],
+    with _result_write_lock(session.results_dir):
+        final_dir = _next_result_directory(session.results_dir)
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{final_dir.name}-", suffix=".tmp", dir=session.results_dir
+            )
         )
-        report = _build_report(result, config, source_pairs)
-        (staging_dir / "report.json").write_text(
-            json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-        (staging_dir / "report.md").write_text(
-            _report_markdown(report), encoding="utf-8"
-        )
-        _write_rectified_previews(staging_dir, result, readable_sources[:3])
-        os.rename(staging_dir, final_dir)
-        return final_dir
-    except BaseException:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
-        raise
+        try:
+            numeric = _numeric_artifacts(result)
+            np.savez_compressed(staging_dir / "stereo_calibration.npz", **numeric)
+            _write_yaml_artifact(
+                staging_dir / "stereo_calibration.yaml",
+                result,
+                config.capture.image_size,
+                [pair.pair_id for pair in source_pairs],
+            )
+            report = _build_report(result, config, source_pairs)
+            (staging_dir / "report.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            (staging_dir / "report.md").write_text(
+                _report_markdown(report), encoding="utf-8"
+            )
+            _write_rectified_previews(staging_dir, result, readable_sources[:3])
+            _verify_artifacts(staging_dir, result, report, config.capture.image_size)
+            _fsync_artifacts(staging_dir)
+            if _lstat_or_none(final_dir) is not None:
+                raise FileExistsError(f"calibration run already exists: {final_dir.name}")
+            os.rename(staging_dir, final_dir)
+            _fsync_directory(session.results_dir)
+            return final_dir
+        except BaseException as primary_error:
+            try:
+                if _lstat_or_none(staging_dir) is not None:
+                    _cleanup_staging(staging_dir)
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "calibration artifact operation failed: "
+                    f"{primary_error}; staging cleanup failed: {cleanup_error}"
+                ) from primary_error
+            raise
 
 
 def _validate_image_size(image_size: object) -> tuple[int, int]:
@@ -375,6 +407,150 @@ def _validate_observations(samples: list[StereoObservation]) -> None:
             raise ValueError("all observations must use identical object points")
 
 
+def _validate_calibration_result(result: CalibrationResult, config: AppConfig) -> None:
+    """Reject malformed calibration data before artifact handling has side effects."""
+    if not isinstance(result, CalibrationResult):
+        raise ValueError("result must be a CalibrationResult")
+    width, height = _validate_image_size(config.capture.image_size)
+    reference = config.baseline_reference_mm
+    if not _is_plain_finite_number(reference) or reference <= 0:
+        raise ValueError("baseline reference must be a positive finite number")
+    if type(result.pair_count) is not int or result.pair_count <= 0:
+        raise ValueError("pair_count must be a positive plain integer")
+
+    for label, value in (
+        ("left_rms", result.left_rms),
+        ("right_rms", result.right_rms),
+        ("stereo_rms", result.stereo_rms),
+        ("vertical_error_median_px", result.vertical_error_median_px),
+        ("vertical_error_p95_px", result.vertical_error_p95_px),
+    ):
+        _require_finite_nonnegative(value, label)
+
+    matrices = {
+        "left_camera_matrix": (result.left_camera_matrix, (3, 3)),
+        "right_camera_matrix": (result.right_camera_matrix, (3, 3)),
+        "rotation": (result.rotation, (3, 3)),
+        "essential": (result.essential, (3, 3)),
+        "fundamental": (result.fundamental, (3, 3)),
+        "rectification_left": (result.rectification_left, (3, 3)),
+        "rectification_right": (result.rectification_right, (3, 3)),
+        "translation": (result.translation, (3, 1)),
+        "projection_left": (result.projection_left, (3, 4)),
+        "projection_right": (result.projection_right, (3, 4)),
+        "disparity_to_depth": (result.disparity_to_depth, (4, 4)),
+    }
+    for label, (values, shape) in matrices.items():
+        _require_array(values, label, np.dtype(np.float64), shape)
+    for label, camera_matrix in (
+        ("left_camera_matrix", result.left_camera_matrix),
+        ("right_camera_matrix", result.right_camera_matrix),
+    ):
+        if camera_matrix[0, 0] <= 0 or camera_matrix[1, 1] <= 0:
+            raise ValueError(f"{label} focal lengths must be positive")
+
+    _require_distortion(result.left_distortion, "left_distortion")
+    _require_distortion(result.right_distortion, "right_distortion")
+    if not np.allclose(
+        result.rotation.T @ result.rotation,
+        np.eye(3, dtype=np.float64),
+        rtol=0.0,
+        atol=1e-5,
+    ) or not math.isclose(
+        float(np.linalg.det(result.rotation)), 1.0, rel_tol=0.0, abs_tol=1e-5
+    ):
+        raise ValueError("rotation must be a proper orthonormal rotation matrix")
+
+    expected_map_shape = (height, width)
+    for label, values in (
+        ("map_left_x", result.map_left_x),
+        ("map_left_y", result.map_left_y),
+        ("map_right_x", result.map_right_x),
+        ("map_right_y", result.map_right_y),
+    ):
+        _require_array(values, label, np.dtype(np.float32), expected_map_shape)
+
+    if not isinstance(result.per_pair_errors, dict):
+        raise ValueError("per_pair_errors must be a dictionary")
+    if result.pair_count != len(result.per_pair_errors):
+        raise ValueError("pair_count must equal the per-pair error count")
+    for pair_id, errors in result.per_pair_errors.items():
+        if type(pair_id) is not int or pair_id < 0:
+            raise ValueError("per-pair error IDs must be non-negative plain integers")
+        if not isinstance(errors, dict):
+            raise ValueError(f"pair {pair_id} errors must be a dictionary")
+        try:
+            left = errors["left_rmse_px"]
+            right = errors["right_rmse_px"]
+        except KeyError as exc:
+            raise ValueError(f"pair {pair_id} errors are missing {exc.args[0]}") from exc
+        _require_finite_nonnegative(left, f"pair {pair_id} left_rmse_px")
+        _require_finite_nonnegative(right, f"pair {pair_id} right_rmse_px")
+        computed = math.sqrt((float(left) ** 2 + float(right) ** 2) / 2.0)
+        if "combined_rmse_px" in errors:
+            supplied = errors["combined_rmse_px"]
+            _require_finite_nonnegative(supplied, f"pair {pair_id} combined_rmse_px")
+            if not math.isclose(
+                float(supplied), computed, rel_tol=1e-9, abs_tol=1e-12
+            ):
+                raise ValueError(f"pair {pair_id} combined_rmse_px is inconsistent with left/right")
+
+
+def _validate_source_pairs(
+    result: CalibrationResult, source_pairs: Sequence[SavedPair]
+) -> None:
+    source_ids: list[int] = []
+    for index, pair in enumerate(source_pairs):
+        if not isinstance(pair, SavedPair):
+            raise ValueError(f"source pair {index} must be a SavedPair")
+        if type(pair.pair_id) is not int or pair.pair_id < 0:
+            raise ValueError("source pair IDs must be non-negative plain integers")
+        source_ids.append(pair.pair_id)
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("source pair IDs must be unique")
+    if result.pair_count != len(source_ids):
+        raise ValueError("result pair_count must equal the source pair count")
+    if set(source_ids) != set(result.per_pair_errors):
+        raise ValueError("source pair IDs must exactly match result pair IDs")
+
+
+def _is_plain_finite_number(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _require_finite_nonnegative(value: object, label: str) -> None:
+    if not _is_plain_finite_number(value):
+        raise ValueError(f"{label} must be finite")
+    if value < 0:
+        raise ValueError(f"{label} must be non-negative")
+
+
+def _require_array(
+    values: object, label: str, dtype: np.dtype[Any], shape: tuple[int, ...]
+) -> None:
+    if not isinstance(values, np.ndarray):
+        raise ValueError(f"{label} must be a numpy array")
+    if values.dtype != dtype:
+        raise ValueError(f"{label} must have dtype {dtype.name}")
+    if values.shape != shape:
+        raise ValueError(f"{label} must have shape {shape}")
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{label} must contain only finite values")
+
+
+def _require_distortion(values: object, label: str) -> None:
+    if not isinstance(values, np.ndarray):
+        raise ValueError(f"{label} must be a numpy array")
+    if values.dtype != np.float64:
+        raise ValueError(f"{label} must have dtype float64")
+    if values.ndim != 2 or 1 not in values.shape or values.size not in (4, 5, 8, 12, 14):
+        raise ValueError(
+            f"{label} must be a 2-D row or column vector with 4, 5, 8, 12, or 14 coefficients"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{label} must contain only finite values")
+
+
 def _reprojection_rmse(
     object_points: NDArray[np.float32],
     measured: NDArray[np.float32],
@@ -426,24 +602,42 @@ def _metadata_corners(
     return np.array(corners, dtype=np.float32, copy=True)
 
 
+def _require_corners_in_bounds(
+    corners: NDArray[np.float32], image_size: tuple[int, int], label: str
+) -> None:
+    width, height = image_size
+    coordinates = corners.reshape(-1, 2)
+    if np.any(coordinates[:, 0] < 0) or np.any(coordinates[:, 0] >= width):
+        raise ValueError(f"{label} contains coordinates outside image bounds {width}x{height}")
+    if np.any(coordinates[:, 1] < 0) or np.any(coordinates[:, 1] >= height):
+        raise ValueError(f"{label} contains coordinates outside image bounds {width}x{height}")
+
+
 def _load_preview_sources(
     source_pairs: Sequence[SavedPair],
+    expected_size: tuple[int, int],
 ) -> list[tuple[SavedPair, NDArray[np.uint8], NDArray[np.uint8]]]:
     readable: list[tuple[SavedPair, NDArray[np.uint8], NDArray[np.uint8]]] = []
-    seen: set[int] = set()
+    expected_width, expected_height = expected_size
     for pair in source_pairs:
-        if type(pair.pair_id) is not int or pair.pair_id < 0:
-            raise ValueError("source pair IDs must be non-negative integers")
-        if pair.pair_id in seen:
-            raise ValueError("source pair IDs must be unique")
-        seen.add(pair.pair_id)
         try:
             left = _read_saved_image(pair.left_path, "left image")
             right = _read_saved_image(pair.right_path, "right image")
         except ValueError:
             continue
-        if left.shape[:2] != right.shape[:2]:
-            continue
+        left_size = (left.shape[1], left.shape[0])
+        right_size = (right.shape[1], right.shape[0])
+        if left_size != right_size:
+            raise ValueError(
+                f"source pair {pair.pair_id} left/right image dimensions differ: "
+                f"{left_size[0]}x{left_size[1]} versus {right_size[0]}x{right_size[1]}"
+            )
+        if left_size != expected_size:
+            raise ValueError(
+                f"source pair {pair.pair_id} image dimensions "
+                f"{left_size[0]}x{left_size[1]} do not match configured dimensions "
+                f"{expected_width}x{expected_height}"
+            )
         readable.append((pair, left, right))
     return readable
 
@@ -716,10 +910,189 @@ def _write_rectified_previews(
             raise OSError(f"could not write rectified preview for pair {pair.pair_id}")
 
 
+def _verify_artifacts(
+    staging_dir: Path,
+    result: CalibrationResult,
+    report: dict[str, Any],
+    image_size: tuple[int, int],
+) -> None:
+    """Reopen every artifact and validate its interoperable structure."""
+    expected_numeric = _numeric_artifacts(result)
+    npz_path = staging_dir / "stereo_calibration.npz"
+    try:
+        with np.load(npz_path, allow_pickle=False) as archive:
+            if set(archive.files) != set(expected_numeric):
+                raise ValueError("NPZ artifact keys are incomplete or unexpected")
+            for name, expected in expected_numeric.items():
+                loaded = archive[name]
+                expected_array = np.asarray(expected)
+                if loaded.shape != expected_array.shape:
+                    raise ValueError(f"NPZ artifact {name} has an unexpected shape")
+                if loaded.dtype != expected_array.dtype:
+                    raise ValueError(f"NPZ artifact {name} has an unexpected dtype")
+                if not np.all(np.isfinite(loaded)):
+                    raise ValueError(f"NPZ artifact {name} contains non-finite values")
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("NPZ artifact"):
+            raise
+        raise ValueError(f"NPZ artifact failed reopen validation: {exc}") from exc
+
+    yaml_shapes = {
+        "left_camera_matrix": (3, 3),
+        "right_camera_matrix": (3, 3),
+        "left_distortion": result.left_distortion.shape,
+        "right_distortion": result.right_distortion.shape,
+        "rotation": (3, 3),
+        "translation": (3, 1),
+        "essential": (3, 3),
+        "fundamental": (3, 3),
+        "rectification_left": (3, 3),
+        "rectification_right": (3, 3),
+        "projection_left": (3, 4),
+        "projection_right": (3, 4),
+        "disparity_to_depth": (4, 4),
+    }
+    storage = cv2.FileStorage(
+        str(staging_dir / "stereo_calibration.yaml"), cv2.FILE_STORAGE_READ
+    )
+    if not storage.isOpened():
+        raise ValueError("YAML artifact failed reopen validation")
+    try:
+        for name, expected_shape in yaml_shapes.items():
+            values = storage.getNode(name).mat()
+            if values is None or values.shape != expected_shape:
+                raise ValueError(f"YAML artifact {name} has an unexpected shape")
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"YAML artifact {name} contains non-finite values")
+    finally:
+        storage.release()
+
+    try:
+        reopened_report = json.loads(
+            (staging_dir / "report.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"JSON report failed reopen validation: {exc}") from exc
+    if reopened_report != report:
+        raise ValueError("JSON report changed during reopen validation")
+    try:
+        markdown = (staging_dir / "report.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Markdown report failed reopen validation: {exc}") from exc
+    if not markdown.startswith("# 双目相机标定报告\n"):
+        raise ValueError("Markdown report has unexpected content")
+
+    width, height = image_size
+    previews = sorted((staging_dir / "previews").glob("*.png"))
+    if len(previews) < 3:
+        raise ValueError("preview artifact set has fewer than 3 images")
+    expected_shape = (height, width * 2, 3)
+    for path in previews:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"preview {path.name} failed reopen validation")
+        if image.shape != expected_shape:
+            raise ValueError(
+                f"preview {path.name} has unexpected shape {image.shape}; "
+                f"expected {expected_shape}"
+            )
+
+
+def _fsync_artifacts(staging_dir: Path) -> None:
+    artifact_files = [
+        staging_dir / "stereo_calibration.npz",
+        staging_dir / "stereo_calibration.yaml",
+        staging_dir / "report.json",
+        staging_dir / "report.md",
+        *sorted((staging_dir / "previews").glob("*.png")),
+    ]
+    for path in artifact_files:
+        _fsync_regular_file(path)
+    _fsync_directory(staging_dir / "previews")
+    _fsync_directory(staging_dir)
+
+
+def _fsync_regular_file(path: Path) -> None:
+    if path.is_symlink():
+        raise OSError(f"refusing to fsync symlink artifact: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    file_descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise OSError(f"artifact is not a regular file: {path}")
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def _fsync_directory(directory: Path) -> None:
+    directory_descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        try:
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            unsupported = {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_descriptor)
+
+
+@contextmanager
+def _result_write_lock(results_dir: Path) -> Iterator[None]:
+    """Serialize cooperating artifact publishers across threads and processes."""
+    state = _lstat_or_none(results_dir)
+    if state is None or not stat.S_ISDIR(state.st_mode) or stat.S_ISLNK(state.st_mode):
+        raise OSError(f"results directory is missing or invalid: {results_dir}")
+    key = str(results_dir.absolute())
+    with _RESULT_THREAD_LOCKS_GUARD:
+        thread_lock = _RESULT_THREAD_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        lock_path = results_dir / _RESULT_LOCK_FILENAME
+        lock_state = _lstat_or_none(lock_path)
+        if lock_state is not None:
+            if stat.S_ISLNK(lock_state.st_mode):
+                raise OSError(f"calibration result lock is a symlink: {lock_path}")
+            if not stat.S_ISREG(lock_state.st_mode):
+                raise OSError(f"calibration result lock is not regular: {lock_path}")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        lock_descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+                raise OSError(f"calibration result lock is not regular: {lock_path}")
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+
+
+def _cleanup_staging(staging_dir: Path) -> None:
+    state = _lstat_or_none(staging_dir)
+    if state is None:
+        return
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise OSError(f"staging path is not a regular directory: {staging_dir}")
+    shutil.rmtree(staging_dir)
+
+
+def _lstat_or_none(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _current_datetime() -> datetime:
+    return datetime.now()
+
+
 def _next_result_directory(results_dir: Path) -> Path:
-    timestamp = datetime.now()
+    timestamp = _current_datetime()
     while True:
         candidate = results_dir / timestamp.strftime("%Y%m%d-%H%M%S%f")
-        if not candidate.exists() and not candidate.is_symlink():
+        if _lstat_or_none(candidate) is None:
             return candidate
         timestamp += timedelta(microseconds=1)
