@@ -566,6 +566,32 @@ class ScriptedSource:
             raise self.close_error
 
 
+class GateSecondWaitEvent:
+    """Expose the worker's second retry wait without relying on sleeps."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._wait_count = 0
+        self.second_wait_entered = threading.Event()
+        self.allow_second_wait = threading.Event()
+
+    def set(self) -> None:
+        self._event.set()
+
+    def clear(self) -> None:
+        self._event.clear()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._wait_count += 1
+        if self._wait_count == 2:
+            self.second_wait_entered.set()
+            assert self.allow_second_wait.wait(timeout=1.0)
+        return self._event.wait(timeout)
+
+
 def successful_detection(frame: np.ndarray, board, quality) -> DetectionResult:
     corners = np.arange(board.corner_count * 2, dtype=np.float32).reshape(-1, 1, 2)
     return DetectionResult(True, corners, 10.0, 0.0, True, True, ())
@@ -664,6 +690,78 @@ def test_worker_retry_during_healthy_stream_closes_and_reopens_fresh_source(
     assert second_exhausted.wait(timeout=1.0)
     second_release.set()
     worker.stop()
+    assert first.close_count == second.close_count == 1
+
+
+@pytest.mark.parametrize(
+    ("first_action", "close_error", "expected_error"),
+    [
+        (make_pair(1), RuntimeError("close during retry"), "close during retry"),
+        (CameraError("read during retry"), None, "read during retry"),
+    ],
+)
+def test_worker_requires_new_explicit_retry_when_pending_retry_attempt_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    first_action: FramePair | Exception,
+    close_error: Exception | None,
+    expected_error: str,
+) -> None:
+    first_read = threading.Event()
+    release_first_read = threading.Event()
+    first = ScriptedSource(
+        [first_action],
+        before_read=first_read,
+        allow_read=release_first_read,
+        close_error=close_error,
+    )
+    second_release = threading.Event()
+    second_exhausted = threading.Event()
+    second = ScriptedSource(
+        [make_pair(2)],
+        block_when_exhausted=second_release,
+        exhausted=second_exhausted,
+    )
+    sources = deque([first, second])
+    factory_calls = 0
+
+    def source_factory() -> ScriptedSource:
+        nonlocal factory_calls
+        factory_calls += 1
+        return sources.popleft()
+
+    monkeypatch.setattr(cameras, "detect_checkerboard", successful_detection)
+    config = make_config()
+    worker = CameraWorker(source_factory, config.checkerboard, config.quality)
+    retry_event = GateSecondWaitEvent()
+    worker._retry_event = retry_event
+    worker.start()
+    assert first_read.wait(timeout=1.0)
+
+    worker.retry()
+    release_first_read.set()
+    try:
+        assert retry_event.second_wait_entered.wait(timeout=1.0)
+        failure = worker.snapshot()
+        assert expected_error in failure.error
+        assert failure.pair is None
+        assert factory_calls == 1
+        assert first.close_count == 1
+        assert not retry_event.is_set()
+
+        worker.retry()
+        retry_event.allow_second_wait.set()
+        recovered = wait_for(
+            worker,
+            lambda item: item.pair is not None and item.pair.left[0, 0, 0] == 2,
+        )
+        assert recovered.error is None
+        assert factory_calls == 2
+        assert second_exhausted.wait(timeout=1.0)
+    finally:
+        retry_event.allow_second_wait.set()
+        second_release.set()
+        worker.stop()
+
     assert first.close_count == second.close_count == 1
 
 

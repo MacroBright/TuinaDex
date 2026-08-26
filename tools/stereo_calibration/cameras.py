@@ -488,6 +488,12 @@ class CameraWorker:
                     except Exception as exc:
                         close_error = exc
 
+            if primary_error is not None or close_error is not None:
+                # A retry request belongs to the source attempt that just
+                # failed. Cancel it before publishing so the visible error is
+                # stable; a new retry made after publication remains set.
+                self._retry_event.clear()
+
             if primary_error is not None:
                 self._publish(
                     None,
