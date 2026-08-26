@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>双目相机标定引导</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, "PingFang SC", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0d1117; color: #e6edf3; }
+    main { width: min(1180px, 96vw); margin: 18px auto 36px; }
+    h1 { margin: 0 0 4px; font-size: 24px; }
+    .subtle { color: #8b949e; font-size: 13px; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; margin-top: 12px; }
+    #preview { display: block; width: 100%; aspect-ratio: 8 / 3; object-fit: contain; background: #010409; border-radius: 7px; }
+    .camera-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .camera-card h2 { margin: 0 0 8px; font-size: 16px; }
+    dl { display: grid; grid-template-columns: 86px 1fr; margin: 0; gap: 5px 9px; font-size: 13px; }
+    dt { color: #8b949e; } dd { margin: 0; overflow-wrap: anywhere; }
+    .session-row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+    progress { width: min(420px, 75vw); height: 18px; }
+    .hint { padding: 13px; border-left: 4px solid #58a6ff; background: #0d2239; border-radius: 5px; }
+    .stop { color: #ffdf5d; font-weight: 700; margin-top: 7px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 9px; }
+    button { border: 1px solid #8b949e; border-radius: 6px; background: #21262d; color: #e6edf3; padding: 9px 14px; cursor: pointer; }
+    button.primary { background: #238636; border-color: #2ea043; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    #error { min-height: 1.4em; color: #ff7b72; white-space: pre-wrap; }
+    .ok { color: #56d364; } .bad { color: #ff7b72; }
+    @media (max-width: 720px) { .camera-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>双目相机标定引导</h1>
+  <div class="subtle">页面仅通过本机 SSH 隧道使用，相机由后台采集线程独占。</div>
+
+  <section class="panel"><img id="preview" alt="左右相机实时预览"></section>
+
+  <section class="camera-grid">
+    <article class="panel camera-card">
+      <h2>左相机</h2>
+      <dl>
+        <dt>设备</dt><dd id="left-device">--</dd>
+        <dt>健康状态</dt><dd id="left-health">--</dd>
+        <dt>棋盘格角点</dt><dd id="left-corners">--</dd>
+        <dt>清晰度</dt><dd id="left-sharpness">--</dd>
+        <dt>饱和比例</dt><dd id="left-saturation">--</dd>
+        <dt>拒绝原因</dt><dd id="left-reasons">--</dd>
+      </dl>
+    </article>
+    <article class="panel camera-card">
+      <h2>右相机</h2>
+      <dl>
+        <dt>设备</dt><dd id="right-device">--</dd>
+        <dt>健康状态</dt><dd id="right-health">--</dd>
+        <dt>棋盘格角点</dt><dd id="right-corners">--</dd>
+        <dt>清晰度</dt><dd id="right-sharpness">--</dd>
+        <dt>饱和比例</dt><dd id="right-saturation">--</dd>
+        <dt>拒绝原因</dt><dd id="right-reasons">--</dd>
+      </dl>
+    </article>
+  </section>
+
+  <section class="panel">
+    <div class="session-row">
+      <strong>会话 <span id="session-id">--</span></strong>
+      <span><span id="pair-count">0</span>/<span id="pair-target">30</span> 组</span>
+      <progress id="pair-progress" value="0" max="30"></progress>
+    </div>
+  </section>
+
+  <section class="panel hint">
+    <strong>下一组建议：</strong><span id="sampling-hint">先将棋盘格放在画面中心</span>
+    <div class="stop">请让标定板停止移动后再保存！</div>
+  </section>
+
+  <section class="panel actions">
+    <button class="primary" id="capture" disabled>保存这一组</button>
+    <button id="reject">移除上一组</button>
+    <button id="retry">重新连接相机</button>
+    <button id="calibrate">开始标定</button>
+  </section>
+
+  <section class="panel">
+    <dl>
+      <dt>标定状态</dt><dd id="calibration-state">idle</dd>
+      <dt>最新报告</dt><dd id="report-path">暂无</dd>
+    </dl>
+    <div id="error" role="alert"></div>
+  </section>
+</main>
+
+<script>
+  "use strict";
+  const byId = (id) => document.getElementById(id);
+  const preview = byId("preview");
+  const buttons = {
+    capture: byId("capture"), reject: byId("reject"),
+    retry: byId("retry"), calibrate: byId("calibrate")
+  };
+  let canCapture = false;
+  let actionInFlight = false;
+  let statusInFlight = false;
+  let previewInFlight = false;
+
+  const hints = [
+    "将棋盘格放在画面中心",
+    "依次移到画面四个角",
+    "分别向相反方向倾斜",
+    "靠近相机采一组近距离画面",
+    "远离相机采一组远距离画面"
+  ];
+  let hintIndex = 0;
+  setInterval(() => {
+    hintIndex = (hintIndex + 1) % hints.length;
+    byId("sampling-hint").textContent = hints[hintIndex];
+  }, 4500);
+
+  function numberText(value, digits) {
+    return typeof value === "number" ? value.toFixed(digits) : "--";
+  }
+
+  function renderCamera(side, camera) {
+    byId(`${side}-device`).textContent = `${camera.label || "--"} · ${camera.device || "--"} · 旋转 ${camera.rotation_degrees}°`;
+    byId(`${side}-health`).textContent = camera.health || "--";
+    byId(`${side}-corners`).textContent = `${camera.corner_count || 0} 个 · ${camera.saveable ? "可保存" : "不可保存"}`;
+    byId(`${side}-sharpness`).textContent = numberText(camera.sharpness, 2);
+    byId(`${side}-saturation`).textContent = typeof camera.saturation === "number" ? `${(camera.saturation * 100).toFixed(2)}%` : "--";
+    byId(`${side}-reasons`).textContent = camera.reasons && camera.reasons.length ? camera.reasons.join("；") : "无";
+  }
+
+  function setButtons() {
+    buttons.capture.disabled = actionInFlight || !canCapture;
+    buttons.reject.disabled = actionInFlight;
+    buttons.retry.disabled = actionInFlight;
+    buttons.calibrate.disabled = actionInFlight;
+  }
+
+  async function refreshStatus() {
+    if (statusInFlight) return;
+    statusInFlight = true;
+    try {
+      const response = await fetch("api/status", { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `状态请求失败 ${response.status}`);
+      renderCamera("left", data.left);
+      renderCamera("right", data.right);
+      byId("session-id").textContent = data.session_id;
+      byId("pair-count").textContent = String(data.active_count);
+      byId("pair-target").textContent = String(data.target_pairs);
+      byId("pair-progress").max = data.target_pairs;
+      byId("pair-progress").value = data.active_count;
+      canCapture = Boolean(data.can_capture);
+      const calibration = data.calibration;
+      byId("calibration-state").textContent = calibration.state;
+      byId("report-path").textContent = calibration.report_path || "暂无";
+      byId("error").textContent = calibration.error || data.camera_error || "";
+      setButtons();
+    } catch (error) {
+      byId("error").textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      statusInFlight = false;
+    }
+  }
+
+  function refreshPreview() {
+    if (previewInFlight) return;
+    previewInFlight = true;
+    preview.src = `api/preview.jpg?t=${Date.now()}`;
+  }
+  preview.addEventListener("load", () => { previewInFlight = false; });
+  preview.addEventListener("error", () => { previewInFlight = false; });
+
+  async function runAction(endpoint) {
+    if (actionInFlight) return;
+    actionInFlight = true;
+    byId("error").textContent = "";
+    setButtons();
+    try {
+      const response = await fetch(endpoint, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `操作失败 ${response.status}`);
+      await refreshStatus();
+    } catch (error) {
+      byId("error").textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      actionInFlight = false;
+      setButtons();
+    }
+  }
+
+  buttons.capture.addEventListener("click", () => runAction("api/capture"));
+  buttons.reject.addEventListener("click", () => runAction("api/reject-last"));
+  buttons.retry.addEventListener("click", () => runAction("api/retry-cameras"));
+  buttons.calibrate.addEventListener("click", () => runAction("api/calibrate"));
+
+  refreshStatus();
+  refreshPreview();
+  setInterval(refreshStatus, 500);
+  setInterval(refreshPreview, 200);
+</script>
+</body>
+</html>
