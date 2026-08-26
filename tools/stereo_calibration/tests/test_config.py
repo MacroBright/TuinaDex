@@ -1,6 +1,7 @@
 """Tests for validated stereo calibration configuration."""
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,126 @@ def test_fractional_camera_rotation_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="rotation"):
         AppConfig.from_mapping(mapping)
+
+
+@pytest.mark.parametrize("rotation", [0.0, 180.0, True, 180.9, "180"])
+def test_non_integer_camera_rotation_is_rejected(tmp_path: Path, rotation: object) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping["right"]["rotation_degrees"] = rotation
+
+    with pytest.raises(ConfigError, match="rotation"):
+        AppConfig.from_mapping(mapping)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("capture", "width", 1280.9, "width"),
+        ("capture", "width", "1280", "width"),
+        ("capture", "width", True, "width"),
+        ("capture", "fourcc", 1234, "fourcc"),
+        ("capture", "v4l2_controls", {"gain": True}, "v4l2"),
+    ],
+)
+def test_primitive_types_are_not_coerced(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping[section][field] = value
+
+    with pytest.raises(ConfigError, match=message):
+        AppConfig.from_mapping(mapping)
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("checkerboard", "square_size_mm"),
+        ("quality", "min_laplacian_variance"),
+        ("quality", "max_saturated_fraction"),
+        ("app", "baseline_reference_mm"),
+    ],
+)
+def test_non_finite_physical_values_are_rejected(
+    tmp_path: Path, section: str, field: str
+) -> None:
+    mapping = valid_mapping(tmp_path)
+    target = mapping if section == "app" else mapping[section]
+    target[field] = math.nan
+
+    with pytest.raises(ConfigError):
+        AppConfig.from_mapping(mapping)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_json_non_finite_constants_are_rejected(tmp_path: Path, constant: str) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping["checkerboard"]["square_size_mm"] = float(constant)
+    path = tmp_path / "non-finite.json"
+    path.write_text(json.dumps(mapping), encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        AppConfig.from_json(path)
+
+
+@pytest.mark.parametrize("device", ["/dev/v4l/by-path/../video4", "/dev/v4l/by-path/"])
+def test_camera_device_must_be_a_direct_by_path_child(tmp_path: Path, device: str) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping["left"]["device"] = device
+
+    with pytest.raises(ConfigError, match=r"/dev/v4l/by-path"):
+        AppConfig.from_mapping(mapping)
+
+
+def test_normal_camera_device_path_is_accepted(tmp_path: Path) -> None:
+    config = AppConfig.from_mapping(valid_mapping(tmp_path))
+
+    assert config.left.device == LEFT_CAMERA_PATH
+
+
+def test_loads_committed_example_configuration() -> None:
+    path = Path(__file__).parents[1] / "example_config.json"
+    config = AppConfig.from_json(path)
+
+    assert config.left.device == LEFT_CAMERA_PATH
+    assert config.right.device == RIGHT_CAMERA_PATH
+    assert config.right.rotation_degrees == 180
+    assert config.capture.image_size == (1280, 960)
+    assert config.capture.fps == 30
+    assert config.capture.fourcc == "MJPG"
+    assert dict(config.capture.v4l2_controls) == {
+        "auto_exposure": 1,
+        "exposure_time_absolute": 100,
+        "gain": 32,
+        "white_balance_automatic": 0,
+        "white_balance_temperature": 4600,
+    }
+    assert config.checkerboard.pattern_size == (9, 6)
+    assert config.checkerboard.square_size_mm == 35.0
+    assert config.quality.edge_margin_px == 12
+    assert config.quality.min_laplacian_variance == 60.0
+    assert config.quality.max_saturated_fraction == 0.45
+    assert config.web.host == "127.0.0.1"
+    assert config.web.port == 8765
+    assert config.minimum_pairs == 18
+    assert config.target_pairs == 30
+    assert config.baseline_reference_mm == 200.0
+
+
+def test_controls_are_copied_and_immutable(tmp_path: Path) -> None:
+    controls = {"gain": 32}
+    mapping = valid_mapping(tmp_path)
+    mapping["capture"]["v4l2_controls"] = controls
+    config = AppConfig.from_mapping(mapping)
+
+    controls["gain"] = 99
+    assert config.capture.v4l2_controls["gain"] == 32
+    with pytest.raises(TypeError):
+        config.capture.v4l2_controls["gain"] = 99
 
 
 def test_checkerboard_corner_count_is_54(tmp_path: Path) -> None:

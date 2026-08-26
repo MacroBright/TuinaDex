@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from numbers import Real
+from math import isfinite
 from pathlib import Path
+from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -14,7 +15,7 @@ class ConfigError(ValueError):
     """Raised when a stereo calibration configuration is invalid."""
 
 
-def _mapping(value: Any, label: str) -> Mapping[str, Any]:
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ConfigError(f"{label} must be a mapping")
     return value
@@ -27,11 +28,31 @@ def _required(data: Mapping[str, Any], key: str, label: str) -> Any:
         raise ConfigError(f"{label} is missing required field {key!r}") from exc
 
 
-def _rotation_value(value: Any) -> int:
-    """Parse a rotation without truncating fractional or boolean values."""
-    if isinstance(value, bool) or not isinstance(value, Real) or value not in (0, 180):
-        raise ConfigError("camera rotation must be numeric and exactly 0 or 180 degrees")
-    return int(value)
+def _require_string(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} must be a string")
+    return value
+
+
+def _require_integer(value: Any, label: str) -> int:
+    if type(value) is not int:
+        raise ConfigError(f"{label} must be an integer")
+    return value
+
+
+def _require_finite_number(value: Any, label: str) -> float:
+    if type(value) not in (int, float) or not isfinite(value):
+        raise ConfigError(f"{label} must be a finite number")
+    return float(value)
+
+
+def _require_device_path(value: Any, label: str) -> str:
+    device = _require_string(value, label)
+    base = PurePosixPath("/dev/v4l/by-path")
+    candidate = PurePosixPath(device)
+    if not candidate.is_absolute() or candidate.parent != base or not candidate.name:
+        raise ConfigError(f"{label} must be a direct child of /dev/v4l/by-path")
+    return device
 
 
 @dataclass(frozen=True)
@@ -44,23 +65,18 @@ class CameraConfig:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "CameraConfig":
-        source = _mapping(data, "camera")
-        try:
-            camera = cls(
-                name=str(_required(source, "name", "camera")),
-                device=str(_required(source, "device", "camera")),
-                rotation_degrees=_rotation_value(
-                    _required(source, "rotation_degrees", "camera")
-                ),
-            )
-        except ConfigError:
-            raise
-        except (TypeError, ValueError) as exc:
-            raise ConfigError("camera name, device, and rotation_degrees are invalid") from exc
+        source = _require_mapping(data, "camera")
+        camera = cls(
+            name=_require_string(_required(source, "name", "camera"), "camera name"),
+            device=_require_device_path(
+                _required(source, "device", "camera"), "camera device"
+            ),
+            rotation_degrees=_require_integer(
+                _required(source, "rotation_degrees", "camera"), "camera rotation"
+            ),
+        )
         if not camera.name:
             raise ConfigError("camera name must not be empty")
-        if not camera.device.startswith("/dev/v4l/by-path/"):
-            raise ConfigError("camera device must use /dev/v4l/by-path")
         if camera.rotation_degrees not in (0, 180):
             raise ConfigError("camera rotation must be 0 or 180 degrees")
         return camera
@@ -126,86 +142,107 @@ class AppConfig:
 
     @classmethod
     def from_json(cls, path: Path | str) -> "AppConfig":
+        def reject_constant(value: str) -> Any:
+            raise ConfigError(f"JSON constant {value!r} is not a finite number")
+
         try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            payload = json.loads(
+                Path(path).read_text(encoding="utf-8"), parse_constant=reject_constant
+            )
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ConfigError(f"could not read configuration {path!s}") from exc
         return cls.from_mapping(payload)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "AppConfig":
-        source = _mapping(data, "application configuration")
+        source = _require_mapping(data, "application configuration")
         left = CameraConfig.from_mapping(_required(source, "left", "application configuration"))
         right = CameraConfig.from_mapping(_required(source, "right", "application configuration"))
         if left.device == right.device:
             raise ConfigError("left and right cameras must use different devices")
 
-        capture_source = _mapping(
+        capture_source = _require_mapping(
             _required(source, "capture", "application configuration"), "capture"
         )
-        try:
-            capture = CaptureConfig(
-                width=int(_required(capture_source, "width", "capture")),
-                height=int(_required(capture_source, "height", "capture")),
-                fps=int(_required(capture_source, "fps", "capture")),
-                fourcc=str(_required(capture_source, "fourcc", "capture")),
-                v4l2_controls=MappingProxyType(
-                    dict(
-                        _mapping(
-                            _required(capture_source, "v4l2_controls", "capture"),
-                            "capture.v4l2_controls",
-                        )
-                    )
-                ),
+        controls_source = _require_mapping(
+            _required(capture_source, "v4l2_controls", "capture"), "capture.v4l2_controls"
+        )
+        controls = {
+            _require_string(name, "v4l2 control name"): _require_integer(
+                value, f"v4l2 control {name!r}"
             )
-            checkerboard_source = _mapping(
-                _required(source, "checkerboard", "application configuration"), "checkerboard"
-            )
-            checkerboard = CheckerboardConfig(
-                columns=int(_required(checkerboard_source, "columns", "checkerboard")),
-                rows=int(_required(checkerboard_source, "rows", "checkerboard")),
-                square_size_mm=float(
-                    _required(checkerboard_source, "square_size_mm", "checkerboard")
-                ),
-            )
-            quality_source = _mapping(
-                _required(source, "quality", "application configuration"), "quality"
-            )
-            quality = QualityConfig(
-                edge_margin_px=int(_required(quality_source, "edge_margin_px", "quality")),
-                min_laplacian_variance=float(
-                    _required(quality_source, "min_laplacian_variance", "quality")
-                ),
-                max_saturated_fraction=float(
-                    _required(quality_source, "max_saturated_fraction", "quality")
-                ),
-            )
-            web_source = _mapping(
-                _required(source, "web", "application configuration"), "web"
-            )
-            web = WebConfig(
-                host=str(_required(web_source, "host", "web")),
-                port=int(_required(web_source, "port", "web")),
-            )
-            config = cls(
-                left=left,
-                right=right,
-                capture=capture,
-                checkerboard=checkerboard,
-                quality=quality,
-                data_root=Path(_required(source, "data_root", "application configuration"))
-                .expanduser(),
-                web=web,
-                minimum_pairs=int(_required(source, "minimum_pairs", "application configuration")),
-                target_pairs=int(_required(source, "target_pairs", "application configuration")),
-                baseline_reference_mm=float(
-                    _required(source, "baseline_reference_mm", "application configuration")
-                ),
-            )
-        except ConfigError:
-            raise
-        except (TypeError, ValueError, OSError) as exc:
-            raise ConfigError("application configuration contains invalid values") from exc
+            for name, value in controls_source.items()
+        }
+        capture = CaptureConfig(
+            width=_require_integer(_required(capture_source, "width", "capture"), "capture width"),
+            height=_require_integer(
+                _required(capture_source, "height", "capture"), "capture height"
+            ),
+            fps=_require_integer(_required(capture_source, "fps", "capture"), "capture fps"),
+            fourcc=_require_string(_required(capture_source, "fourcc", "capture"), "capture fourcc"),
+            v4l2_controls=controls,
+        )
+        checkerboard_source = _require_mapping(
+            _required(source, "checkerboard", "application configuration"), "checkerboard"
+        )
+        checkerboard = CheckerboardConfig(
+            columns=_require_integer(
+                _required(checkerboard_source, "columns", "checkerboard"), "checkerboard columns"
+            ),
+            rows=_require_integer(
+                _required(checkerboard_source, "rows", "checkerboard"), "checkerboard rows"
+            ),
+            square_size_mm=_require_finite_number(
+                _required(checkerboard_source, "square_size_mm", "checkerboard"),
+                "checkerboard square size",
+            ),
+        )
+        quality_source = _require_mapping(
+            _required(source, "quality", "application configuration"), "quality"
+        )
+        quality = QualityConfig(
+            edge_margin_px=_require_integer(
+                _required(quality_source, "edge_margin_px", "quality"), "quality edge margin"
+            ),
+            min_laplacian_variance=_require_finite_number(
+                _required(quality_source, "min_laplacian_variance", "quality"),
+                "minimum Laplacian variance",
+            ),
+            max_saturated_fraction=_require_finite_number(
+                _required(quality_source, "max_saturated_fraction", "quality"),
+                "maximum saturated fraction",
+            ),
+        )
+        web_source = _require_mapping(
+            _required(source, "web", "application configuration"), "web"
+        )
+        web = WebConfig(
+            host=_require_string(_required(web_source, "host", "web"), "web host"),
+            port=_require_integer(_required(web_source, "port", "web"), "web port"),
+        )
+        config = cls(
+            left=left,
+            right=right,
+            capture=capture,
+            checkerboard=checkerboard,
+            quality=quality,
+            data_root=Path(
+                _require_string(
+                    _required(source, "data_root", "application configuration"), "data root"
+                )
+            ).expanduser(),
+            web=web,
+            minimum_pairs=_require_integer(
+                _required(source, "minimum_pairs", "application configuration"), "minimum pairs"
+            ),
+            target_pairs=_require_integer(
+                _required(source, "target_pairs", "application configuration"), "target pairs"
+            ),
+            baseline_reference_mm=_require_finite_number(
+                _required(source, "baseline_reference_mm", "application configuration"),
+                "baseline reference",
+            ),
+        )
         config.validate()
         return config
 
@@ -214,43 +251,64 @@ class AppConfig:
         if self.left.device == self.right.device:
             raise ConfigError("left and right cameras must use different devices")
         for camera in (self.left, self.right):
-            if not camera.device.startswith("/dev/v4l/by-path/"):
-                raise ConfigError("camera device must use /dev/v4l/by-path")
-            if (
-                isinstance(camera.rotation_degrees, bool)
-                or not isinstance(camera.rotation_degrees, Real)
-                or camera.rotation_degrees not in (0, 180)
-            ):
+            _require_string(camera.name, "camera name")
+            _require_device_path(camera.device, "camera device")
+            rotation = _require_integer(camera.rotation_degrees, "camera rotation")
+            if rotation not in (0, 180):
                 raise ConfigError("camera rotation must be 0 or 180 degrees")
 
-        if self.capture.width <= 0 or self.capture.height <= 0 or self.capture.fps <= 0:
+        width = _require_integer(self.capture.width, "capture width")
+        height = _require_integer(self.capture.height, "capture height")
+        fps = _require_integer(self.capture.fps, "capture fps")
+        if width <= 0 or height <= 0 or fps <= 0:
             raise ConfigError("capture width, height, and fps must be positive")
-        if not isinstance(self.capture.fourcc, str) or len(self.capture.fourcc) != 4:
+        fourcc = _require_string(self.capture.fourcc, "capture fourcc")
+        if len(fourcc) != 4:
             raise ConfigError("capture fourcc must contain four characters")
-        controls = self.capture.v4l2_controls
-        if not controls or not all(
-            isinstance(name, str) and name and isinstance(value, int) and not isinstance(value, bool)
-            for name, value in controls.items()
-        ):
+        controls = _require_mapping(self.capture.v4l2_controls, "capture.v4l2_controls")
+        if not controls:
             raise ConfigError("v4l2 controls must be a non-empty string-to-integer mapping")
+        for name, value in controls.items():
+            if not _require_string(name, "v4l2 control name"):
+                raise ConfigError("v4l2 control names must not be empty")
+            _require_integer(value, f"v4l2 control {name!r}")
 
-        if self.checkerboard.columns < 2 or self.checkerboard.rows < 2:
+        columns = _require_integer(self.checkerboard.columns, "checkerboard columns")
+        rows = _require_integer(self.checkerboard.rows, "checkerboard rows")
+        square_size_mm = _require_finite_number(
+            self.checkerboard.square_size_mm, "checkerboard square size"
+        )
+        if columns < 2 or rows < 2:
             raise ConfigError("checkerboard dimensions must be at least 2x2")
-        if self.checkerboard.square_size_mm <= 0:
+        if square_size_mm <= 0:
             raise ConfigError("checkerboard square size must be positive")
-        if self.quality.edge_margin_px < 0 or self.quality.min_laplacian_variance < 0:
+        edge_margin_px = _require_integer(self.quality.edge_margin_px, "quality edge margin")
+        min_laplacian_variance = _require_finite_number(
+            self.quality.min_laplacian_variance, "minimum Laplacian variance"
+        )
+        max_saturated_fraction = _require_finite_number(
+            self.quality.max_saturated_fraction, "maximum saturated fraction"
+        )
+        if edge_margin_px < 0 or min_laplacian_variance < 0:
             raise ConfigError("quality thresholds must be non-negative")
-        if not 0.0 < self.quality.max_saturated_fraction < 1.0:
+        if not 0.0 < max_saturated_fraction < 1.0:
             raise ConfigError("max saturated fraction must be between 0 and 1")
-        if self.minimum_pairs < 3:
+        minimum_pairs = _require_integer(self.minimum_pairs, "minimum pairs")
+        target_pairs = _require_integer(self.target_pairs, "target pairs")
+        if minimum_pairs < 3:
             raise ConfigError("minimum pairs must be at least 3")
-        if self.target_pairs < self.minimum_pairs:
+        if target_pairs < minimum_pairs:
             raise ConfigError("target pairs must be greater than or equal to minimum pairs")
-        if self.baseline_reference_mm <= 0:
+        baseline_reference_mm = _require_finite_number(
+            self.baseline_reference_mm, "baseline reference"
+        )
+        if baseline_reference_mm <= 0:
             raise ConfigError("baseline reference must be positive")
-        if self.web.host != "127.0.0.1":
+        host = _require_string(self.web.host, "web host")
+        port = _require_integer(self.web.port, "web port")
+        if host != "127.0.0.1":
             raise ConfigError("web server must bind to 127.0.0.1")
-        if self.web.port <= 0 or self.web.port > 65535:
+        if port <= 0 or port > 65535:
             raise ConfigError("web port must be between 1 and 65535")
 
     def to_mapping(self) -> dict[str, Any]:
