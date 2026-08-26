@@ -622,9 +622,12 @@ def _load_preview_sources(
     for pair in source_pairs:
         try:
             left = _read_saved_image(pair.left_path, "left image")
+        except ValueError as exc:
+            raise ValueError(f"source pair {pair.pair_id} {exc}") from exc
+        try:
             right = _read_saved_image(pair.right_path, "right image")
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError(f"source pair {pair.pair_id} {exc}") from exc
         left_size = (left.shape[1], left.shape[0])
         right_size = (right.shape[1], right.shape[0])
         if left_size != right_size:
@@ -932,25 +935,33 @@ def _verify_artifacts(
                     raise ValueError(f"NPZ artifact {name} has an unexpected dtype")
                 if not np.all(np.isfinite(loaded)):
                     raise ValueError(f"NPZ artifact {name} contains non-finite values")
+                if np.issubdtype(loaded.dtype, np.floating):
+                    values_match = np.allclose(
+                        loaded, expected_array, rtol=1e-12, atol=1e-12
+                    )
+                else:
+                    values_match = np.array_equal(loaded, expected_array)
+                if not values_match:
+                    raise ValueError(f"NPZ artifact {name} value does not match expected")
     except (OSError, ValueError) as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("NPZ artifact"):
             raise
         raise ValueError(f"NPZ artifact failed reopen validation: {exc}") from exc
 
-    yaml_shapes = {
-        "left_camera_matrix": (3, 3),
-        "right_camera_matrix": (3, 3),
-        "left_distortion": result.left_distortion.shape,
-        "right_distortion": result.right_distortion.shape,
-        "rotation": (3, 3),
-        "translation": (3, 1),
-        "essential": (3, 3),
-        "fundamental": (3, 3),
-        "rectification_left": (3, 3),
-        "rectification_right": (3, 3),
-        "projection_left": (3, 4),
-        "projection_right": (3, 4),
-        "disparity_to_depth": (4, 4),
+    yaml_matrices = {
+        "left_camera_matrix": result.left_camera_matrix,
+        "right_camera_matrix": result.right_camera_matrix,
+        "left_distortion": result.left_distortion,
+        "right_distortion": result.right_distortion,
+        "rotation": result.rotation,
+        "translation": result.translation,
+        "essential": result.essential,
+        "fundamental": result.fundamental,
+        "rectification_left": result.rectification_left,
+        "rectification_right": result.rectification_right,
+        "projection_left": result.projection_left,
+        "projection_right": result.projection_right,
+        "disparity_to_depth": result.disparity_to_depth,
     }
     storage = cv2.FileStorage(
         str(staging_dir / "stereo_calibration.yaml"), cv2.FILE_STORAGE_READ
@@ -958,12 +969,45 @@ def _verify_artifacts(
     if not storage.isOpened():
         raise ValueError("YAML artifact failed reopen validation")
     try:
-        for name, expected_shape in yaml_shapes.items():
+        for name, expected in yaml_matrices.items():
             values = storage.getNode(name).mat()
-            if values is None or values.shape != expected_shape:
+            if values is None or values.shape != expected.shape:
                 raise ValueError(f"YAML artifact {name} has an unexpected shape")
             if not np.all(np.isfinite(values)):
                 raise ValueError(f"YAML artifact {name} contains non-finite values")
+            if not np.allclose(values, expected, rtol=1e-12, atol=1e-12):
+                raise ValueError(f"YAML artifact {name} values do not match expected")
+
+        width, height = image_size
+        yaml_scalars = {
+            "pair_count": result.pair_count,
+            "left_rms": result.left_rms,
+            "right_rms": result.right_rms,
+            "stereo_rms": result.stereo_rms,
+            "vertical_error_median_px": result.vertical_error_median_px,
+            "vertical_error_p95_px": result.vertical_error_p95_px,
+            "baseline_mm": result.baseline_mm,
+            "image_width": width,
+            "image_height": height,
+        }
+        for name, expected in yaml_scalars.items():
+            node = storage.getNode(name)
+            if node.empty():
+                raise ValueError(f"YAML artifact {name} is missing")
+            value = float(node.real())
+            if not math.isfinite(value):
+                raise ValueError(f"YAML artifact {name} is non-finite")
+            if not math.isclose(value, float(expected), rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError(f"YAML artifact {name} does not match expected")
+
+        expected_source_ids = np.asarray(
+            report["source_pair_ids"], dtype=np.int32
+        ).reshape(-1, 1)
+        source_ids = storage.getNode("source_pair_ids").mat()
+        if source_ids is None or source_ids.shape != expected_source_ids.shape:
+            raise ValueError("YAML artifact source_pair_ids has an unexpected shape")
+        if not np.array_equal(source_ids, expected_source_ids):
+            raise ValueError("YAML artifact source_pair_ids does not match expected")
     finally:
         storage.release()
 
@@ -979,13 +1023,16 @@ def _verify_artifacts(
         markdown = (staging_dir / "report.md").read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"Markdown report failed reopen validation: {exc}") from exc
-    if not markdown.startswith("# 双目相机标定报告\n"):
-        raise ValueError("Markdown report has unexpected content")
+    if markdown != _report_markdown(report):
+        raise ValueError("Markdown report does not match expected content")
 
-    width, height = image_size
     previews = sorted((staging_dir / "previews").glob("*.png"))
-    if len(previews) < 3:
-        raise ValueError("preview artifact set has fewer than 3 images")
+    expected_preview_names = [
+        f"pair_{pair_id:04d}_rectified.png"
+        for pair_id in report["source_pair_ids"][:3]
+    ]
+    if [path.name for path in previews] != expected_preview_names:
+        raise ValueError("preview artifact names do not match expected source pairs")
     expected_shape = (height, width * 2, 3)
     for path in previews:
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -996,6 +1043,9 @@ def _verify_artifacts(
                 f"preview {path.name} has unexpected shape {image.shape}; "
                 f"expected {expected_shape}"
             )
+        for y in range(40, height, 40):
+            if not np.all(image[y, :, :] == np.array([0, 255, 0], dtype=np.uint8)):
+                raise ValueError(f"preview {path.name} is missing horizontal line at y={y}")
 
 
 def _fsync_artifacts(staging_dir: Path) -> None:
@@ -1057,16 +1107,56 @@ def _result_write_lock(results_dir: Path) -> Iterator[None]:
                 raise OSError(f"calibration result lock is not regular: {lock_path}")
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         lock_descriptor = os.open(lock_path, flags, 0o600)
+        primary_error: BaseException | None = None
+        lock_acquired = False
+        cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
                 raise OSError(f"calibration result lock is not regular: {lock_path}")
             fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            lock_acquired = True
+            yield
+        except BaseException as exc:
+            primary_error = exc
+
+        if lock_acquired:
             try:
-                yield
-            finally:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_descriptor)
+                _unlock_result_lock(lock_descriptor)
+            except BaseException as exc:
+                cleanup_errors.append(("unlock", exc))
+        try:
+            _close_result_lock(lock_descriptor)
+        except BaseException as exc:
+            cleanup_errors.append(("close", exc))
+
+        if primary_error is not None:
+            if cleanup_errors:
+                details = "; ".join(
+                    f"{operation} failure: {error}"
+                    for operation, error in cleanup_errors
+                )
+                raise RuntimeError(
+                    f"calibration result operation failed: {primary_error}; "
+                    f"lock cleanup failed: {details}"
+                ) from primary_error
+            raise primary_error
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0][1]
+        if cleanup_errors:
+            details = "; ".join(
+                f"{operation} failure: {error}" for operation, error in cleanup_errors
+            )
+            raise RuntimeError(f"calibration result lock cleanup failed: {details}") from (
+                cleanup_errors[0][1]
+            )
+
+
+def _unlock_result_lock(lock_descriptor: int) -> None:
+    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+
+
+def _close_result_lock(lock_descriptor: int) -> None:
+    os.close(lock_descriptor)
 
 
 def _cleanup_staging(staging_dir: Path) -> None:

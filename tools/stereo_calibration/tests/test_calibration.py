@@ -403,6 +403,11 @@ def test_write_run_round_trips_npz_yaml_json_markdown_and_previews(
 
     previews = sorted((run_dir / "previews").glob("*.png"))
     assert len(previews) >= 3
+    assert [path.name for path in previews] == [
+        "pair_0001_rectified.png",
+        "pair_0002_rectified.png",
+        "pair_0003_rectified.png",
+    ]
     preview = cv2.imread(str(previews[0]))
     assert preview is not None
     assert preview.shape == (48, 128, 3)
@@ -506,6 +511,94 @@ def test_preview_source_dimensions_must_match_config_before_staging(tmp_path: Pa
         write_calibration_run(store, _artifact_result(), config, sources)
 
     assert list(store.results_dir.iterdir()) == []
+
+
+def test_any_unreadable_source_pair_prevents_publication_even_with_three_good_pairs(
+    tmp_path: Path,
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "unreadable-fourth")
+    errors = {
+        pair_id: {
+            "left_rmse_px": 0.1,
+            "right_rmse_px": 0.1,
+            "combined_rmse_px": 0.1,
+        }
+        for pair_id in (1, 2, 3, 4)
+    }
+    result = _artifact_result(per_pair_errors=errors)
+    sources = _source_pairs(store, (1, 2, 3, 4))
+    sources[3].right_path.unlink()
+
+    with pytest.raises(ValueError, match="source pair 4 right image is missing"):
+        write_calibration_run(store, result, config, sources)
+
+    assert list(store.results_dir.iterdir()) == []
+
+
+def test_reopen_validation_compares_npz_numeric_values_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "corrupt-npz")
+    original = calibration.np.savez_compressed
+
+    def corrupt_npz(path: Path, **arrays: np.ndarray) -> None:
+        changed = dict(arrays)
+        changed["left_rms"] = np.array(9.0, dtype=np.float64)
+        original(path, **changed)
+
+    monkeypatch.setattr(calibration.np, "savez_compressed", corrupt_npz)
+
+    with pytest.raises(ValueError, match="NPZ artifact left_rms.*value"):
+        write_calibration_run(store, _artifact_result(), config, _source_pairs(store))
+
+    assert not [path for path in store.results_dir.iterdir() if path.is_dir()]
+
+
+def test_reopen_validation_compares_yaml_scalar_metadata_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "corrupt-yaml")
+    original = calibration._write_yaml_artifact
+
+    def corrupt_yaml(*args: object, **kwargs: object) -> None:
+        original(*args, **kwargs)
+        path = args[0]
+        text = path.read_text(encoding="utf-8")
+        changed, count = re.subn(r"(?m)^pair_count:.*$", "pair_count: 99", text)
+        assert count == 1
+        path.write_text(changed, encoding="utf-8")
+
+    monkeypatch.setattr(calibration, "_write_yaml_artifact", corrupt_yaml)
+
+    with pytest.raises(ValueError, match="YAML artifact pair_count.*does not match"):
+        write_calibration_run(store, _artifact_result(), config, _source_pairs(store))
+
+    assert not [path for path in store.results_dir.iterdir() if path.is_dir()]
+
+
+def test_reopen_validation_compares_exact_markdown_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "corrupt-markdown")
+    original = calibration._report_markdown
+    calls = 0
+
+    def corrupt_first_markdown(report: dict) -> str:
+        nonlocal calls
+        calls += 1
+        text = original(report)
+        return text + "篡改\n" if calls == 1 else text
+
+    monkeypatch.setattr(calibration, "_report_markdown", corrupt_first_markdown)
+
+    with pytest.raises(ValueError, match="Markdown report does not match"):
+        write_calibration_run(store, _artifact_result(), config, _source_pairs(store))
+
+    assert not [path for path in store.results_dir.iterdir() if path.is_dir()]
 
 
 def test_outlier_is_reported_without_deleting_or_excluding_source_pair(
@@ -642,11 +735,19 @@ def test_reopen_validation_rejects_wrong_preview_shape_without_publishing(
 def test_fewer_than_three_readable_pairs_fails_before_publishing(tmp_path: Path) -> None:
     config = _artifact_config(tmp_path)
     store = SessionStore.create(tmp_path, "too-few")
-    sources = _source_pairs(store)
-    sources[2].right_path.unlink()
+    errors = {
+        pair_id: {
+            "left_rmse_px": 0.1,
+            "right_rmse_px": 0.1,
+            "combined_rmse_px": 0.1,
+        }
+        for pair_id in (1, 2)
+    }
+    result = _artifact_result(per_pair_errors=errors)
+    sources = _source_pairs(store, (1, 2))
 
     with pytest.raises(ValueError, match="at least 3 readable source pairs"):
-        write_calibration_run(store, _artifact_result(), config, sources)
+        write_calibration_run(store, result, config, sources)
 
     assert list(store.results_dir.iterdir()) == []
 
@@ -703,3 +804,35 @@ def test_cleanup_failure_reports_primary_and_cleanup_and_stale_stage_is_not_a_ru
     assert re.fullmatch(r"\d{8}-\d{12}", run_dir.name)
     assert json.loads((run_dir / "report.json").read_text(encoding="utf-8"))["status"] == "pass"
     assert stale[0].is_dir()
+
+
+def test_body_failure_is_preserved_when_unlock_and_close_both_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "lock-cleanup-failure")
+    sources = _source_pairs(store)
+    original_close = calibration._close_result_lock
+
+    def fail_write(*args: object, **kwargs: object) -> None:
+        raise OSError("primary write failure")
+
+    def fail_unlock(file_descriptor: int) -> None:
+        raise OSError("unlock failure")
+
+    def close_then_fail(file_descriptor: int) -> None:
+        original_close(file_descriptor)
+        raise OSError("close failure")
+
+    monkeypatch.setattr(calibration, "_write_yaml_artifact", fail_write)
+    monkeypatch.setattr(calibration, "_unlock_result_lock", fail_unlock)
+    monkeypatch.setattr(calibration, "_close_result_lock", close_then_fail)
+
+    with pytest.raises(RuntimeError) as captured:
+        write_calibration_run(store, _artifact_result(), config, sources)
+
+    assert "primary write failure" in str(captured.value)
+    assert "unlock failure" in str(captured.value)
+    assert "close failure" in str(captured.value)
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "primary write failure" in str(captured.value.__cause__)
