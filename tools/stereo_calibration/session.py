@@ -166,6 +166,7 @@ class SessionStore:
         events: list[dict[str, Any]] = []
         active: dict[int, dict[str, Any]] = {}
         active_lines: dict[int, int] = {}
+        rejected_lines: dict[int, int] = {}
         captured: set[int] = set()
         try:
             with self.manifest_path.open("r", encoding="utf-8") as manifest:
@@ -187,6 +188,7 @@ class SessionStore:
                             )
                         del active[pair_id]
                         del active_lines[pair_id]
+                        rejected_lines[pair_id] = line_number
                     events.append(event)
         except (OSError, UnicodeError) as exc:
             raise SessionError(f"could not read manifest {self.manifest_path}") from exc
@@ -202,6 +204,18 @@ class SessionStore:
                 raise SessionError(
                     f"manifest line {active_lines[pair_id]}: active pair {pair_id} is "
                     "missing image files"
+                )
+        for pair_id, line_number in rejected_lines.items():
+            left_path, right_path = self._pair_paths(self.rejected_dir, pair_id)
+            if left_path.exists() != right_path.exists():
+                raise SessionError(
+                    f"manifest line {line_number}: rejected pair {pair_id} has mismatched "
+                    "left/right files (missing rejected image)"
+                )
+            if not left_path.is_file() or not right_path.is_file():
+                raise SessionError(
+                    f"manifest line {line_number}: rejected pair {pair_id} is missing "
+                    "rejected image files"
                 )
         return events, active
 
@@ -242,13 +256,13 @@ class SessionStore:
         return directory / f"{stem}_left.png", directory / f"{stem}_right.png"
 
     def _append_event(self, event: dict[str, Any]) -> None:
-        payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         try:
+            payload = _compact_json(event)
             with self.manifest_path.open("a", encoding="utf-8") as manifest:
                 manifest.write(payload + "\n")
                 manifest.flush()
                 os.fsync(manifest.fileno())
-        except (OSError, UnicodeError) as exc:
+        except (OSError, TypeError, UnicodeError, ValueError) as exc:
             raise SessionError("could not append manifest event") from exc
 
     @staticmethod
@@ -268,12 +282,18 @@ def _reject_json_constant(value: str) -> Any:
     raise ValueError(f"invalid JSON constant {value!r}")
 
 
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
 def _copy_metadata(metadata: Any) -> dict[str, Any]:
     if not isinstance(metadata, dict):
         raise SessionError("metadata must be a dictionary")
     try:
-        copied = json.loads(json.dumps(metadata, ensure_ascii=False, allow_nan=False))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        payload = _compact_json(metadata)
+        payload.encode("utf-8")
+        copied = json.loads(payload, parse_constant=_reject_json_constant)
+    except (TypeError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise SessionError("metadata must be JSON-serializable") from exc
     if not isinstance(copied, dict):
         raise SessionError("metadata must be a dictionary")

@@ -95,6 +95,19 @@ def test_rejected_id_is_never_reused(tmp_path: Path, image: np.ndarray) -> None:
     assert store.save_pair(image, image, {}).pair_id == 2
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_open_refuses_missing_rejected_image(
+    tmp_path: Path, image: np.ndarray, side: str
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    store.save_pair(image, image, {})
+    store.reject_last("bad")
+    (store.rejected_dir / f"pair_0001_{side}.png").unlink()
+
+    with pytest.raises(SessionError, match=r"pair 1.*missing rejected image"):
+        SessionStore.open(store.session_dir)
+
+
 def test_reject_last_refuses_when_there_is_no_active_pair(tmp_path: Path) -> None:
     store = SessionStore.create(tmp_path, "run")
 
@@ -157,6 +170,25 @@ def test_save_refuses_to_overwrite_existing_final_or_temp_file(
     assert store.manifest_path.read_text() == ""
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_save_refuses_final_file_created_after_candidate_id_selection(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch, side: str
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    candidate_id = store._next_pair_id([])
+    target = store.pairs_dir / f"pair_{candidate_id:04d}_{side}.png"
+    sentinel = b"existing image bytes"
+    target.write_bytes(sentinel)
+    monkeypatch.setattr(store, "_next_pair_id", lambda _events: candidate_id)
+
+    with pytest.raises(SessionError, match="refusing to overwrite"):
+        store.save_pair(image, image, {})
+
+    assert target.read_bytes() == sentinel
+    assert list(store.pairs_dir.iterdir()) == [target]
+    assert store.manifest_path.read_text() == ""
+
+
 def test_failed_left_encode_leaves_no_files_or_event(
     tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -199,6 +231,27 @@ def test_nonserializable_metadata_is_rejected_before_creating_files(
     with pytest.raises(SessionError, match="metadata"):
         store.save_pair(image, image, {"not_json": object()})
 
+    assert list(store.pairs_dir.iterdir()) == []
+    assert store.manifest_path.read_text() == ""
+
+
+def test_unpaired_surrogate_metadata_is_rejected_before_image_io(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    calls = 0
+
+    def record_image_write(*_args: object) -> bool:
+        nonlocal calls
+        calls += 1
+        return True
+
+    monkeypatch.setattr(session.cv2, "imwrite", record_image_write)
+
+    with pytest.raises(SessionError, match="metadata"):
+        store.save_pair(image, image, {"bad": "\ud800"})
+
+    assert calls == 0
     assert list(store.pairs_dir.iterdir()) == []
     assert store.manifest_path.read_text() == ""
 
