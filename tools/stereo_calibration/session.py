@@ -172,6 +172,7 @@ class SessionStore:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 self._require_layout()
+                self._clear_stale_manifest_temp()
                 self._clear_stale_reject_transaction_temp()
                 self._recover_reject_transaction()
                 yield
@@ -391,8 +392,22 @@ class SessionStore:
             os.replace(self.reject_transaction_temp_path, self.reject_transaction_path)
             _fsync_directory(self.session_dir)
         except (OSError, SessionError) as exc:
-            self._cleanup_known_regular_temp(self.reject_transaction_temp_path)
-            raise SessionError("could not write reject transaction marker") from exc
+            self._raise_after_temp_cleanup(
+                "could not write reject transaction marker",
+                self.reject_transaction_temp_path,
+                exc,
+            )
+
+    def _clear_stale_manifest_temp(self) -> None:
+        temp_state = _lstat_or_none(self.manifest_temp_path)
+        if temp_state is None:
+            return
+        if stat.S_ISLNK(temp_state.st_mode):
+            raise SessionError("manifest temporary file is a symlink")
+        if not stat.S_ISREG(temp_state.st_mode):
+            raise SessionError("manifest temporary file is not a regular file")
+        self._cleanup_known_regular_temp(self.manifest_temp_path)
+        _fsync_directory(self.session_dir)
 
     def _clear_stale_reject_transaction_temp(self) -> None:
         temp_state = _lstat_or_none(self.reject_transaction_temp_path)
@@ -402,8 +417,8 @@ class SessionStore:
             raise SessionError("reject transaction temporary marker is a symlink")
         if not stat.S_ISREG(temp_state.st_mode):
             raise SessionError("reject transaction temporary marker is not a regular file")
-        if _lstat_or_none(self.reject_transaction_path) is None:
-            self._cleanup_known_regular_temp(self.reject_transaction_temp_path)
+        self._cleanup_known_regular_temp(self.reject_transaction_temp_path)
+        _fsync_directory(self.session_dir)
 
     def _recover_reject_transaction(self) -> None:
         transaction = self._read_reject_transaction()
@@ -512,8 +527,23 @@ class SessionStore:
             os.replace(self.manifest_temp_path, self.manifest_path)
             _fsync_directory(self.session_dir)
         except (OSError, SessionError, TypeError, UnicodeError, ValueError) as exc:
-            self._cleanup_known_regular_temp(self.manifest_temp_path)
-            raise SessionError("could not append manifest event") from exc
+            self._raise_after_temp_cleanup(
+                "could not append manifest event", self.manifest_temp_path, exc
+            )
+
+    def _raise_after_temp_cleanup(
+        self, operation: str, temp_path: Path, primary_error: BaseException
+    ) -> None:
+        try:
+            self._cleanup_known_regular_temp(temp_path)
+        except SessionError as cleanup_error:
+            cleanup_detail = str(cleanup_error)
+            if cleanup_error.__cause__ is not None:
+                cleanup_detail = f"{cleanup_detail}: {cleanup_error.__cause__}"
+            raise SessionError(
+                f"{operation}: {primary_error}; temporary cleanup failed: {cleanup_detail}"
+            ) from primary_error
+        raise SessionError(operation) from primary_error
 
     def _cleanup_known_regular_temp(self, path: Path) -> None:
         path_state = _lstat_or_none(path)
@@ -611,7 +641,7 @@ def _fsync_directory(directory: Path) -> None:
     try:
         os.fsync(directory_fd)
     except OSError as exc:
-        unsupported_errors = {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+        unsupported_errors = {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
         if exc.errno not in unsupported_errors:
             raise SessionError(f"could not fsync directory: {directory}") from exc
     finally:
