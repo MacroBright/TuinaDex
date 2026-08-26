@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -88,6 +91,24 @@ def test_interleaved_store_instances_refresh_the_next_id(tmp_path: Path, image: 
 
     assert first.save_pair(image, image, {}).pair_id == 1
     assert second.save_pair(image, image, {}).pair_id == 2
+
+
+def test_concurrent_independent_store_instances_allocate_contiguous_ids(
+    tmp_path: Path, image: np.ndarray
+) -> None:
+    first = SessionStore.create(tmp_path, "run")
+    second = SessionStore.open(first.session_dir)
+    stores = [first, second] * 6
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        saved = list(executor.map(lambda store: store.save_pair(image, image, {}), stores))
+
+    assert sorted(pair.pair_id for pair in saved) == list(range(1, 13))
+    events = [json.loads(line) for line in first.manifest_path.read_text().splitlines()]
+    assert [event["action"] for event in events] == ["capture"] * 12
+    assert [pair.pair_id for pair in SessionStore.open(first.session_dir).active_pairs()] == list(
+        range(1, 13)
+    )
 
 
 def test_reject_last_moves_pair_logs_event_and_removes_it_from_active(
@@ -423,6 +444,190 @@ def test_open_finishes_rejection_after_manifest_append_writes_then_fails(
         "capture",
         "reject",
     ]
+
+
+def test_capture_interrupted_manifest_write_keeps_reopenable_old_manifest(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    real_write = session.os.write
+    failed = False
+
+    def partial_then_fail(file_descriptor: int, payload: bytes) -> int:
+        nonlocal failed
+        if b'"action":"capture"' in payload:
+            failed = True
+            return real_write(file_descriptor, payload[:5])
+        if failed:
+            raise OSError(errno.EIO, "injected manifest write failure")
+        return real_write(file_descriptor, payload)
+
+    monkeypatch.setattr(session.os, "write", partial_then_fail)
+
+    with pytest.raises(SessionError, match="manifest"):
+        store.save_pair(image, image, {})
+
+    monkeypatch.setattr(session.os, "write", real_write)
+    reopened = SessionStore.open(store.session_dir)
+
+    assert reopened.active_pairs() == []
+    assert reopened.manifest_path.read_bytes() == b""
+    assert not (store.session_dir / ".manifest.jsonl.tmp").exists()
+    assert reopened.save_pair(image, image, {}).pair_id == 2
+
+
+def test_reject_interrupted_manifest_write_recovers_one_reject_event(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    store.save_pair(image, image, {})
+    real_write = session.os.write
+    failed = False
+
+    def partial_then_fail(file_descriptor: int, payload: bytes) -> int:
+        nonlocal failed
+        if b'"action":"reject"' in payload:
+            failed = True
+            return real_write(file_descriptor, payload[:5])
+        if failed:
+            raise OSError(errno.EIO, "injected manifest write failure")
+        return real_write(file_descriptor, payload)
+
+    monkeypatch.setattr(session.os, "write", partial_then_fail)
+
+    with pytest.raises(SessionError, match="manifest"):
+        store.reject_last("bad")
+
+    monkeypatch.setattr(session.os, "write", real_write)
+    reopened = SessionStore.open(store.session_dir)
+
+    assert reopened.active_pairs() == []
+    assert not (store.session_dir / ".reject-transaction.json").exists()
+    assert [json.loads(line)["action"] for line in reopened.manifest_path.read_text().splitlines()] == [
+        "capture",
+        "reject",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync", "replace"])
+def test_failed_marker_publication_cleans_temp_and_allows_retry(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    saved = store.save_pair(image, image, {})
+    marker = store.session_dir / ".reject-transaction.json"
+    marker_temp = store.session_dir / ".reject-transaction.tmp"
+
+    with monkeypatch.context() as fault:
+        if failure == "write":
+            real_write = session.os.write
+
+            def fail_marker_write(file_descriptor: int, payload: bytes) -> int:
+                if b'"pair_id":1' in payload:
+                    raise OSError(errno.EIO, "injected marker write failure")
+                return real_write(file_descriptor, payload)
+
+            fault.setattr(session.os, "write", fail_marker_write)
+        elif failure == "fsync":
+            real_fsync = session.os.fsync
+
+            def fail_marker_fsync(file_descriptor: int) -> None:
+                raise OSError(errno.EIO, "injected marker fsync failure")
+
+            fault.setattr(session.os, "fsync", fail_marker_fsync)
+        else:
+            real_replace = session.os.replace
+
+            def fail_marker_replace(source: Path, target: Path) -> None:
+                if target == marker:
+                    raise OSError(errno.EIO, "injected marker replace failure")
+                real_replace(source, target)
+
+            fault.setattr(session.os, "replace", fail_marker_replace)
+
+        with pytest.raises(SessionError, match="marker"):
+            store.reject_last("bad")
+
+    assert saved.left_path.is_file()
+    assert saved.right_path.is_file()
+    assert not marker.exists()
+    assert not marker_temp.exists()
+    assert [json.loads(line)["action"] for line in store.manifest_path.read_text().splitlines()] == [
+        "capture"
+    ]
+
+    assert SessionStore.open(store.session_dir).reject_last("bad").pair_id == 1
+
+
+def test_open_cleans_regular_stale_marker_temp_without_published_marker(tmp_path: Path) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    marker_temp = store.session_dir / ".reject-transaction.tmp"
+    marker_temp.write_text('{"pair_id":1,"reason":"bad"}', encoding="utf-8")
+
+    reopened = SessionStore.open(store.session_dir)
+
+    assert reopened.session_dir == store.session_dir
+    assert not marker_temp.exists()
+
+
+def test_directory_fsync_eio_raises_session_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+
+    def fail_fsync(_file_descriptor: int) -> None:
+        raise OSError(errno.EIO, "injected directory fsync failure")
+
+    monkeypatch.setattr(session.os, "fsync", fail_fsync)
+
+    with pytest.raises(SessionError, match="fsync directory"):
+        session._fsync_directory(store.pairs_dir)
+
+
+def test_capture_fsyncs_pairs_directory_before_committing_manifest(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    original_directory_fsync = session._fsync_directory
+    original_append = store._append_event
+    pairs_synced = False
+
+    def record_directory_fsync(directory: Path) -> None:
+        nonlocal pairs_synced
+        if directory == store.pairs_dir:
+            pairs_synced = True
+        original_directory_fsync(directory)
+
+    def require_prior_image_sync(event: dict[str, object]) -> None:
+        assert pairs_synced
+        original_append(event)
+
+    monkeypatch.setattr(session, "_fsync_directory", record_directory_fsync)
+    monkeypatch.setattr(store, "_append_event", require_prior_image_sync)
+
+    store.save_pair(image, image, {})
+
+
+def test_capture_pairs_directory_fsync_failure_preserves_orphan_and_skips_id(
+    tmp_path: Path, image: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore.create(tmp_path, "run")
+    real_fsync = session.os.fsync
+
+    def fail_only_directory_fsync(file_descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            raise OSError(errno.EIO, "injected pairs directory fsync failure")
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(session.os, "fsync", fail_only_directory_fsync)
+
+    with pytest.raises(SessionError, match="fsync directory"):
+        store.save_pair(image, image, {})
+
+    monkeypatch.setattr(session.os, "fsync", real_fsync)
+    reopened = SessionStore.open(store.session_dir)
+    assert reopened.active_pairs() == []
+    assert reopened.save_pair(image, image, {}).pair_id == 2
 
 
 def test_metadata_is_defensively_copied_on_save_and_read(tmp_path: Path, image: np.ndarray) -> None:

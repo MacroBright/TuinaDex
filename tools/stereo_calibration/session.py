@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import errno
 import json
 import os
 import re
@@ -50,6 +51,7 @@ class SessionStore:
         self.rejected_dir = session_dir / "rejected"
         self.results_dir = session_dir / "results"
         self.manifest_path = session_dir / "manifest.jsonl"
+        self.manifest_temp_path = session_dir / ".manifest.jsonl.tmp"
         self.lock_path = session_dir / _LOCK_FILENAME
         self.reject_transaction_path = session_dir / _REJECT_TRANSACTION_FILENAME
         self.reject_transaction_temp_path = session_dir / _REJECT_TRANSACTION_TEMP_FILENAME
@@ -110,11 +112,14 @@ class SessionStore:
             try:
                 if not cv2.imwrite(str(left_tmp), left):
                     raise SessionError(f"could not encode left image for pair {pair_id}")
+                _fsync_regular_file(left_tmp, "left temporary image")
                 if not cv2.imwrite(str(right_tmp), right):
                     raise SessionError(f"could not encode right image for pair {pair_id}")
+                _fsync_regular_file(right_tmp, "right temporary image")
                 left_tmp.replace(left_path)
                 right_tmp.replace(right_path)
                 self._require_image_pair(self.pairs_dir, pair_id, "active", None)
+                _fsync_directory(self.pairs_dir)
                 self._append_event(
                     {"action": "capture", "pair_id": pair_id, "metadata": safe_metadata}
                 )
@@ -167,6 +172,7 @@ class SessionStore:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 self._require_layout()
+                self._clear_stale_reject_transaction_temp()
                 self._recover_reject_transaction()
                 yield
             except OSError as exc:
@@ -218,36 +224,72 @@ class SessionStore:
         dict[int, int],
         dict[int, int],
     ]:
+        _manifest_bytes, manifest_state = self._read_manifest_bytes()
+        return manifest_state
+
+    def _read_manifest_bytes(
+        self,
+    ) -> tuple[
+        bytes,
+        tuple[
+            list[dict[str, Any]],
+            dict[int, dict[str, Any]],
+            dict[int, int],
+            dict[int, int],
+        ],
+    ]:
+        manifest_fd = _open_existing_regular_file(self.manifest_path, os.O_RDONLY, "manifest")
+        try:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(manifest_fd, 65_536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except OSError as exc:
+            raise SessionError(f"could not read manifest {self.manifest_path}") from exc
+        finally:
+            os.close(manifest_fd)
+        manifest_bytes = b"".join(chunks)
+        try:
+            manifest_text = manifest_bytes.decode("utf-8")
+        except UnicodeError as exc:
+            raise SessionError(f"could not read manifest {self.manifest_path}") from exc
+        return manifest_bytes, self._parse_manifest_text(manifest_text)
+
+    def _parse_manifest_text(
+        self, manifest_text: str
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[int, dict[str, Any]],
+        dict[int, int],
+        dict[int, int],
+    ]:
         events: list[dict[str, Any]] = []
         active: dict[int, dict[str, Any]] = {}
         active_lines: dict[int, int] = {}
         rejected_lines: dict[int, int] = {}
         captured: set[int] = set()
-        manifest_fd = _open_existing_regular_file(self.manifest_path, os.O_RDONLY, "manifest")
-        try:
-            with os.fdopen(manifest_fd, "r", encoding="utf-8") as manifest:
-                for line_number, line in enumerate(manifest, start=1):
-                    event = self._parse_event(line, line_number)
-                    pair_id = event["pair_id"]
-                    if event["action"] == "capture":
-                        if pair_id in captured:
-                            raise SessionError(
-                                f"manifest line {line_number}: duplicate capture for pair {pair_id}"
-                            )
-                        captured.add(pair_id)
-                        active[pair_id] = event["metadata"]
-                        active_lines[pair_id] = line_number
-                    else:
-                        if pair_id not in active:
-                            raise SessionError(
-                                f"manifest line {line_number}: no active pair {pair_id} to reject"
-                            )
-                        del active[pair_id]
-                        del active_lines[pair_id]
-                        rejected_lines[pair_id] = line_number
-                    events.append(event)
-        except (OSError, UnicodeError) as exc:
-            raise SessionError(f"could not read manifest {self.manifest_path}") from exc
+        for line_number, line in enumerate(manifest_text.splitlines(keepends=True), start=1):
+            event = self._parse_event(line, line_number)
+            pair_id = event["pair_id"]
+            if event["action"] == "capture":
+                if pair_id in captured:
+                    raise SessionError(
+                        f"manifest line {line_number}: duplicate capture for pair {pair_id}"
+                    )
+                captured.add(pair_id)
+                active[pair_id] = event["metadata"]
+                active_lines[pair_id] = line_number
+            else:
+                if pair_id not in active:
+                    raise SessionError(
+                        f"manifest line {line_number}: no active pair {pair_id} to reject"
+                    )
+                del active[pair_id]
+                del active_lines[pair_id]
+                rejected_lines[pair_id] = line_number
+            events.append(event)
         return events, active, active_lines, rejected_lines
 
     @staticmethod
@@ -348,8 +390,20 @@ class SessionStore:
                 os.close(marker_fd)
             os.replace(self.reject_transaction_temp_path, self.reject_transaction_path)
             _fsync_directory(self.session_dir)
-        except OSError as exc:
+        except (OSError, SessionError) as exc:
+            self._cleanup_known_regular_temp(self.reject_transaction_temp_path)
             raise SessionError("could not write reject transaction marker") from exc
+
+    def _clear_stale_reject_transaction_temp(self) -> None:
+        temp_state = _lstat_or_none(self.reject_transaction_temp_path)
+        if temp_state is None:
+            return
+        if stat.S_ISLNK(temp_state.st_mode):
+            raise SessionError("reject transaction temporary marker is a symlink")
+        if not stat.S_ISREG(temp_state.st_mode):
+            raise SessionError("reject transaction temporary marker is not a regular file")
+        if _lstat_or_none(self.reject_transaction_path) is None:
+            self._cleanup_known_regular_temp(self.reject_transaction_temp_path)
 
     def _recover_reject_transaction(self) -> None:
         transaction = self._read_reject_transaction()
@@ -442,17 +496,37 @@ class SessionStore:
 
     def _append_event(self, event: dict[str, Any]) -> None:
         try:
-            payload = _compact_json(event).encode("utf-8") + b"\n"
-            manifest_fd = _open_existing_regular_file(
-                self.manifest_path, os.O_WRONLY | os.O_APPEND, "manifest"
-            )
+            manifest_bytes, _manifest_state = self._read_manifest_bytes()
+            if manifest_bytes and not manifest_bytes.endswith(b"\n"):
+                raise SessionError("manifest must end with a newline before appending an event")
+            if _path_exists_or_symlink(self.manifest_temp_path):
+                raise SessionError("manifest temporary file already exists")
+            payload = manifest_bytes + _compact_json(event).encode("utf-8") + b"\n"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            manifest_fd = os.open(self.manifest_temp_path, flags, 0o600)
             try:
                 _write_all(manifest_fd, payload)
                 os.fsync(manifest_fd)
             finally:
                 os.close(manifest_fd)
-        except (OSError, TypeError, UnicodeError, ValueError) as exc:
+            os.replace(self.manifest_temp_path, self.manifest_path)
+            _fsync_directory(self.session_dir)
+        except (OSError, SessionError, TypeError, UnicodeError, ValueError) as exc:
+            self._cleanup_known_regular_temp(self.manifest_temp_path)
             raise SessionError("could not append manifest event") from exc
+
+    def _cleanup_known_regular_temp(self, path: Path) -> None:
+        path_state = _lstat_or_none(path)
+        if path_state is None:
+            return
+        if stat.S_ISLNK(path_state.st_mode):
+            raise SessionError(f"temporary file is a symlink: {path}")
+        if not stat.S_ISREG(path_state.st_mode):
+            raise SessionError(f"temporary file is not regular: {path}")
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise SessionError(f"could not remove temporary file {path}") from exc
 
     @staticmethod
     def _cleanup_temps(*paths: Path) -> None:
@@ -519,15 +593,27 @@ def _open_existing_regular_file(path: Path, flags: int, label: str) -> int:
     return file_fd
 
 
+def _fsync_regular_file(path: Path, label: str) -> None:
+    file_fd = _open_existing_regular_file(path, os.O_RDONLY, label)
+    try:
+        os.fsync(file_fd)
+    except OSError as exc:
+        raise SessionError(f"could not fsync {label}: {path}") from exc
+    finally:
+        os.close(file_fd)
+
+
 def _fsync_directory(directory: Path) -> None:
     try:
         directory_fd = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as exc:
+        raise SessionError(f"could not open directory for fsync: {directory}") from exc
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
+    except OSError as exc:
+        unsupported_errors = {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+        if exc.errno not in unsupported_errors:
+            raise SessionError(f"could not fsync directory: {directory}") from exc
     finally:
         os.close(directory_fd)
 
