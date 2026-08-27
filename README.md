@@ -174,16 +174,16 @@ TuinaDex 提供标准接口将 22-DOF 遥操数据导出为 Hugging Face LeRobot
 - **数据清洗保障**：在操作员按下 `SPACE` 暂停、`L` 锁定或手部丢失看门狗触发期间，录制器自动暂停写入，杜绝“原地发呆”无意义数据。
 
 详见完整接入规范与实现代码：  
-👉 **[Arm-robot_VLA/docs/tuinadex_to_lerobot.md](./Arm-robot_VLA/docs/tuinadex_to_lerobot.md)**
+👉 **[docs/tuinadex_to_lerobot.md](./docs/tuinadex_to_lerobot.md)**
 
 ---
 
 ## 📚 文档索引
 
 - **协同遥操子系统教程**：[Co_Teleop/README.md](./Co_Teleop/README.md)
-- **LeRobot 接入与对接规范**：[Arm-robot_VLA/docs/tuinadex_to_lerobot.md](./Arm-robot_VLA/docs/tuinadex_to_lerobot.md)
-- **机械臂底层 CAN 驱动协议**：[Arm-robot_VLA/docs/HARDWARE_CAN_SPEC.md](./Arm-robot_VLA/docs/HARDWARE_CAN_SPEC.md)
-- **系统架构设计记录 (ADR)**：[Arm-robot_VLA/CLAUDE.md](./Arm-robot_VLA/CLAUDE.md)
+- **LeRobot 接入与对接规范**：[docs/tuinadex_to_lerobot.md](./docs/tuinadex_to_lerobot.md)
+- **机械臂底层 CAN 驱动协议**：[docs/HARDWARE_CAN_SPEC.md](./docs/HARDWARE_CAN_SPEC.md)
+- **系统架构设计记录 (ADR)**：[Arm-robot_VLA (GitHub)](https://github.com/MacroBright/Arm-robot_VLA/blob/feat/arm-visual-teleop/CLAUDE.md)
 - **Docker 多容器部署指南**：[docker/README.md](./docker/README.md)
 
 ---
@@ -191,5 +191,5 @@ TuinaDex 提供标准接口将 22-DOF 遥操数据导出为 Hugging Face LeRobot
 ## 📄 License
 
 - 顶层工程与 `Co_Teleop` 子系统：[Apache-2.0](./LICENSE)
-- `Arm-robot_VLA` 机械臂模块：[Apache-2.0](./Arm-robot_VLA/LICENSE)
-- `Leap_Hand` 灵巧手模块：[CC BY-NC 4.0](./Leap_Hand/LICENSE)（非商业使用限制）
+- `Arm-robot_VLA` 机械臂模块：[Apache-2.0](https://github.com/MacroBright/Arm-robot_VLA/blob/feat/arm-visual-teleop/LICENSE)
+- `Leap_Hand` 灵巧手模块：[CC BY-NC 4.0](https://github.com/MacroBright/Leap_hand/blob/feat/arm-visual-teleop/LICENSE)（非商业使用限制）
