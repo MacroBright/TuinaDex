@@ -629,6 +629,66 @@ def test_outlier_is_reported_without_deleting_or_excluding_source_pair(
     ).read_text(encoding="utf-8")
 
 
+def test_skipped_pair_diagnostics_are_written_to_both_reports(tmp_path: Path) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "skipped-pairs")
+    diagnostics = [
+        {"pair_id": 4, "reason": "left_corners is missing"},
+        {"pair_id": 5, "reason": "right image is unreadable"},
+    ]
+
+    run_dir = write_calibration_run(
+        store,
+        _artifact_result(),
+        config,
+        _source_pairs(store),
+        skip_diagnostics=diagnostics,
+    )
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    markdown = (run_dir / "report.md").read_text(encoding="utf-8")
+
+    assert report["skipped_pairs"] == diagnostics
+    assert "跳过的图像组：" in markdown
+    assert "4（left_corners is missing）" in markdown
+    assert "5（right image is unreadable）" in markdown
+
+
+@pytest.mark.parametrize(
+    ("diagnostics", "message"),
+    [
+        ([{"pair_id": 1, "reason": "overlaps source"}], "also a calibration source"),
+        (
+            [
+                {"pair_id": 4, "reason": "first"},
+                {"pair_id": 4, "reason": "duplicate"},
+            ],
+            "duplicated",
+        ),
+        ([{"pair_id": 4, "reason": "line one\nline two"}], "control characters"),
+        (
+            [{"pair_id": 4, "reason": "bad", "path": "/private"}],
+            "exactly pair_id and reason",
+        ),
+    ],
+)
+def test_invalid_skip_diagnostics_fail_before_artifact_writes(
+    tmp_path: Path, diagnostics: list[dict[str, object]], message: str
+) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "invalid-skipped-pairs")
+
+    with pytest.raises(ValueError, match=message):
+        write_calibration_run(
+            store,
+            _artifact_result(),
+            config,
+            _source_pairs(store),
+            skip_diagnostics=diagnostics,
+        )
+
+    assert list(store.results_dir.iterdir()) == []
+
+
 def test_baseline_warning_is_reported(tmp_path: Path) -> None:
     config = _artifact_config(tmp_path, baseline_reference_mm=250.0)
     store = SessionStore.create(tmp_path, "baseline")

@@ -267,6 +267,21 @@ def test_capture_rejects_invalid_or_unsaveable_snapshot_without_writing(
     assert store.active_pairs() == []
 
 
+def test_capture_rejects_corners_outside_the_configured_image(tmp_path: Path) -> None:
+    outside = good_corners()
+    outside[0, 0] = (160.0, 30.0)
+    snapshot = replace(
+        good_snapshot(),
+        left_detection=detection(corners=outside),
+    )
+    service, _worker, store, _config = make_service(tmp_path, snapshot)
+
+    assert service.status()["can_capture"] is False
+    with pytest.raises(ServiceError, match="left checkerboard corners.*image bounds"):
+        service.capture()
+    assert store.active_pairs() == []
+
+
 def test_reject_last_and_retry_translate_operations_without_mutating_other_data(
     tmp_path: Path,
 ) -> None:
@@ -308,17 +323,19 @@ def test_background_calibration_transitions_and_uses_exact_valid_sources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, _worker, store, config = make_service(tmp_path)
-    add_active_pairs(store, 3)
+    add_active_pairs(store, 4)
     entered = threading.Event()
     release = threading.Event()
     calls: dict[str, object] = {}
 
     observations = [SimpleNamespace(pair_id=value) for value in (1, 2, 3)]
 
+    skipped = [{"pair_id": 4, "reason": "left_corners is missing"}]
+
     def fake_load(session, board):
         assert session is store
         assert board is config.checkerboard
-        return observations, []
+        return observations, skipped
 
     def fake_calibrate(received, image_size, minimum_pairs):
         calls["calibrate"] = (received, image_size, minimum_pairs)
@@ -326,8 +343,11 @@ def test_background_calibration_transitions_and_uses_exact_valid_sources(
         assert release.wait(2)
         return object()
 
-    def fake_write(session, result, received_config, source_pairs):
+    def fake_write(
+        session, result, received_config, source_pairs, *, skip_diagnostics
+    ):
         calls["source_ids"] = [pair.pair_id for pair in source_pairs]
+        calls["skip_diagnostics"] = skip_diagnostics
         run = session.results_dir / "run-001"
         run.mkdir()
         (run / "report.json").write_text('{"status":"pass"}', encoding="utf-8")
@@ -351,6 +371,7 @@ def test_background_calibration_transitions_and_uses_exact_valid_sources(
     completed = wait_for_state(service, "pass")["calibration"]
     assert calls["calibrate"] == (observations, (160, 120), 3)
     assert calls["source_ids"] == [1, 2, 3]
+    assert calls["skip_diagnostics"] == skipped
     assert completed["report_path"] == "results/run-001/report.json"
     assert completed["error"] is None
 

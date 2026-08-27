@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -301,10 +301,15 @@ def write_calibration_run(
     result: CalibrationResult,
     config: AppConfig,
     source_pairs: list[SavedPair],
+    *,
+    skip_diagnostics: Sequence[Mapping[str, str | int]] = (),
 ) -> Path:
     """Atomically publish a never-overwritten timestamped calibration run."""
     _validate_calibration_result(result, config)
     _validate_source_pairs(result, source_pairs)
+    skipped_pairs = _normalize_skip_diagnostics(
+        skip_diagnostics, {pair.pair_id for pair in source_pairs}
+    )
     readable_sources = _load_preview_sources(source_pairs, config.capture.image_size)
     if len(readable_sources) < 3:
         raise ValueError("at least 3 readable source pairs are required for previews")
@@ -325,7 +330,7 @@ def write_calibration_run(
                 config.capture.image_size,
                 [pair.pair_id for pair in source_pairs],
             )
-            report = _build_report(result, config, source_pairs)
+            report = _build_report(result, config, source_pairs, skipped_pairs)
             (staging_dir / "report.json").write_text(
                 json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
                 encoding="utf-8",
@@ -747,8 +752,44 @@ def _combined_error(errors: dict[str, float]) -> float:
     return float(value)
 
 
+def _normalize_skip_diagnostics(
+    diagnostics: Sequence[Mapping[str, str | int]], source_pair_ids: set[int]
+) -> list[dict[str, str | int]]:
+    if isinstance(diagnostics, (str, bytes)) or not isinstance(diagnostics, Sequence):
+        raise ValueError("skip diagnostics must be a sequence")
+    normalized: list[dict[str, str | int]] = []
+    seen: set[int] = set()
+    for index, diagnostic in enumerate(diagnostics):
+        if not isinstance(diagnostic, Mapping):
+            raise ValueError(f"skip diagnostic {index} must be a mapping")
+        if set(diagnostic) != {"pair_id", "reason"}:
+            raise ValueError(
+                f"skip diagnostic {index} must contain exactly pair_id and reason"
+            )
+        pair_id = diagnostic["pair_id"]
+        reason = diagnostic["reason"]
+        if type(pair_id) is not int or pair_id < 0:
+            raise ValueError(f"skip diagnostic {index} pair ID must be non-negative")
+        if pair_id in seen:
+            raise ValueError(f"skip diagnostic pair ID {pair_id} is duplicated")
+        if pair_id in source_pair_ids:
+            raise ValueError(
+                f"skip diagnostic pair ID {pair_id} is also a calibration source"
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"skip diagnostic {index} reason must be non-empty text")
+        if any(ord(character) < 32 and character != "\t" for character in reason):
+            raise ValueError(f"skip diagnostic {index} reason contains control characters")
+        seen.add(pair_id)
+        normalized.append({"pair_id": pair_id, "reason": reason})
+    return sorted(normalized, key=lambda item: int(item["pair_id"]))
+
+
 def _build_report(
-    result: CalibrationResult, config: AppConfig, source_pairs: Sequence[SavedPair]
+    result: CalibrationResult,
+    config: AppConfig,
+    source_pairs: Sequence[SavedPair],
+    skipped_pairs: Sequence[Mapping[str, str | int]] = (),
 ) -> dict[str, Any]:
     rms_max = max(result.left_rms, result.right_rms, result.stereo_rms)
     if not all(
@@ -819,6 +860,7 @@ def _build_report(
             "baseline_tolerance_fraction": 0.15,
         },
         "source_pair_ids": [pair.pair_id for pair in source_pairs],
+        "skipped_pairs": [dict(item) for item in skipped_pairs],
         "per_pair_errors": {
             str(pair_id): {
                 "left_rmse_px": float(errors["left_rmse_px"]),
@@ -844,6 +886,7 @@ def _report_markdown(report: dict[str, Any]) -> str:
     metrics = report["metrics"]
     baseline = report["baseline_warning"]
     outliers = report["suspected_outliers"]
+    skipped_pairs = report["skipped_pairs"]
     lines = [
         "# 双目相机标定报告",
         "",
@@ -865,6 +908,13 @@ def _report_markdown(report: dict[str, Any]) -> str:
         "",
         "- 源图像组 ID：" + ", ".join(map(str, report["source_pair_ids"])),
     ]
+    if skipped_pairs:
+        lines.append("- 跳过的图像组：")
+        lines.extend(
+            f"  - {item['pair_id']}（{item['reason']}）" for item in skipped_pairs
+        )
+    else:
+        lines.append("- 跳过的图像组：无")
     if outliers:
         lines.append("- 疑似离群组：")
         lines.extend(

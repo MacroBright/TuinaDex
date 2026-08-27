@@ -66,10 +66,14 @@ class CalibrationService:
 
         complete_pair = _pair_has_expected_images(snapshot.pair, self._config)
         left_ready = _detection_is_capture_ready(
-            snapshot.left_detection, self._config.checkerboard.corner_count
+            snapshot.left_detection,
+            self._config.checkerboard.corner_count,
+            self._config.capture.image_size,
         )
         right_ready = _detection_is_capture_ready(
-            snapshot.right_detection, self._config.checkerboard.corner_count
+            snapshot.right_detection,
+            self._config.checkerboard.corner_count,
+            self._config.capture.image_size,
         )
         can_capture = bool(
             snapshot.error is None and complete_pair and left_ready and right_ready
@@ -203,11 +207,13 @@ class CalibrationService:
             snapshot.left_detection,
             self._config.checkerboard.corner_count,
             "left",
+            self._config.capture.image_size,
         )
         right = _validated_corners(
             snapshot.right_detection,
             self._config.checkerboard.corner_count,
             "right",
+            self._config.capture.image_size,
         )
         return snapshot.pair, left, right
 
@@ -302,7 +308,11 @@ class CalibrationService:
                     self._config.minimum_pairs,
                 )
                 run_dir = write_calibration_run(
-                    self._session, result, self._config, source_pairs
+                    self._session,
+                    result,
+                    self._config,
+                    source_pairs,
+                    skip_diagnostics=diagnostics,
                 )
             report_path = Path(run_dir) / "report.json"
             report = _read_report(report_path)
@@ -373,19 +383,24 @@ def _audit_quality(detection: DetectionResult | None) -> dict[str, Any]:
 
 
 def _detection_is_capture_ready(
-    detection: DetectionResult | None, expected_count: int
+    detection: DetectionResult | None,
+    expected_count: int,
+    image_size: tuple[int, int],
 ) -> bool:
     if detection is None or not detection.saveable:
         return False
     try:
-        _validated_corners(detection, expected_count, "camera")
+        _validated_corners(detection, expected_count, "camera", image_size)
     except ServiceError:
         return False
     return True
 
 
 def _validated_corners(
-    detection: DetectionResult | None, expected_count: int, side: str
+    detection: DetectionResult | None,
+    expected_count: int,
+    side: str,
+    image_size: tuple[int, int],
 ) -> NDArray[np.float32]:
     if detection is None:
         raise ServiceError(f"{side} checkerboard detection is missing")
@@ -400,7 +415,16 @@ def _validated_corners(
         )
     if not np.issubdtype(corners.dtype, np.number) or not np.all(np.isfinite(corners)):
         raise ServiceError(f"{side} checkerboard corners must be finite")
-    return np.asarray(corners, dtype=np.float32)
+    width, height = image_size
+    coordinates = corners.reshape(-1, 2)
+    if (
+        np.any(coordinates[:, 0] < 0)
+        or np.any(coordinates[:, 0] >= width)
+        or np.any(coordinates[:, 1] < 0)
+        or np.any(coordinates[:, 1] >= height)
+    ):
+        raise ServiceError(f"{side} checkerboard corners must lie within image bounds")
+    return np.array(corners, dtype=np.float32, copy=True)
 
 
 def _pair_has_expected_images(pair: FramePair | None, config: AppConfig) -> bool:
