@@ -83,7 +83,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["apps*", "packages*"]
+include = ["apps*", "packages*", "Co_Teleop*"]
 exclude = [
     "Arm-robot_VLA*",
     "Leap_Hand*",
@@ -115,7 +115,8 @@ select = ["E", "F", "W", "I"]
 ignore = ["E501"]  # 长行（docstring 中允许）
 
 [tool.pytest.ini_options]
-testpaths = ["apps", "packages"]
+testpaths = ["Co_Teleop/tests", "apps", "packages"]
+pythonpath = [".", "Arm-robot_VLA", "Leap_Hand/python", "Co_Teleop"]
 addopts = "-ra --strict-markers"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

@@ -52,6 +52,7 @@ docker-compose.override.yml
 .idea/
 .claude/                   # Claude Code 临时配置
 .playwright-mcp/           # Playwright MCP 运行时产物 (page-*.png / page-*.yml)
+.arts/                     # CodeArts IDE 运行时产物
 *.swp
 *.swo
 .DS_Store
