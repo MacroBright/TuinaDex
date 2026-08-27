@@ -1,0 +1,14 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行/测试产物
+Output/
+Scripts/tools/runs/
+*.mp4
+
+# 系统/编辑器
+.DS_Store
+.idea/
+.vscode/

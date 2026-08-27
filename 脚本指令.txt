@@ -1,0 +1,13 @@
+##跳转至脚本目录
+cd ~/Desktop/AcuPointDet/Scripts/tools
+
+##测试脚本
+
+#单张图像测试
+python test_single.py ../../TestData/test1.jpg --det ../../Model/RTMDet_Tiny.om
+#延迟分布测试
+python benchmark.py ../../TestData/test1.jpg -n 3
+#完整流程样例
+cd ~/Desktop/AcuPointDet/Scripts/tools
+python main.py --det /home/HwHiAiUser/Desktop/AcuPointDet/Model/RTMDet_Tiny.om --pose /home/HwHiAiUser/Desktop/AcuPointDet/Model/RTMPose_s.om \
+    --input 0 --mode video --show
