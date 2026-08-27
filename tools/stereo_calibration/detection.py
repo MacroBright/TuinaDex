@@ -81,7 +81,9 @@ def detect_checkerboard(
             reasons=tuple(reasons),
         )
 
-    corners = np.array(detected_corners, dtype=np.float32, copy=True)
+    corners = np.array(detected_corners, dtype=np.float32, copy=True).reshape(
+        board.corner_count, 1, 2
+    )
     corners.setflags(write=False)
     coordinates = corners.reshape(-1, 2)
     min_x, min_y = np.floor(coordinates.min(axis=0)).astype(int)

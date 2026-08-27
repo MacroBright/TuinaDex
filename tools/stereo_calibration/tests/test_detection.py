@@ -172,6 +172,31 @@ def test_detected_corners_are_float32_copied_and_read_only(
         result.corners[0, 0, 0] = 1.0
 
 
+def test_opencv5_two_dimensional_corners_are_canonicalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector_corners = np.full((54, 2), 20.0, dtype=np.float32)
+    monkeypatch.setattr(
+        detection.cv2,
+        "findChessboardCornersSB",
+        lambda *_args: (True, detector_corners),
+    )
+    quality = QualityConfig(
+        edge_margin_px=10,
+        min_laplacian_variance=0.0,
+        max_saturated_fraction=1.0,
+    )
+
+    result = detect_checkerboard(
+        np.full((100, 100, 3), 127, dtype=np.uint8), BOARD, quality
+    )
+
+    assert result.corners is not None
+    assert result.corners.shape == (54, 1, 2)
+    assert result.corner_count == 54
+    assert result.saveable
+
+
 def test_out_of_range_corners_produce_empty_roi_blur_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
