@@ -240,6 +240,7 @@ python Co_Teleop/calibration/handeye_calib.py
 ### 步骤 2：启动真机协同遥操系统
 在项目根目录运行：
 ```bash
+conda activate leap_hand ##激活环境
 python run_teleop.py --iface can0 -y
 ```
 > [!NOTE]
