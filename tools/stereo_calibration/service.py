@@ -68,12 +68,12 @@ class CalibrationService:
         left_ready = _detection_is_capture_ready(
             snapshot.left_detection,
             self._config.checkerboard.corner_count,
-            self._config.capture.image_size,
+            self._config.logical_image_size,
         )
         right_ready = _detection_is_capture_ready(
             snapshot.right_detection,
             self._config.checkerboard.corner_count,
-            self._config.capture.image_size,
+            self._config.logical_image_size,
         )
         can_capture = bool(
             snapshot.error is None and complete_pair and left_ready and right_ready
@@ -174,7 +174,7 @@ class CalibrationService:
                         "left": pair.left_timestamp_ns,
                         "right": pair.right_timestamp_ns,
                     },
-                    "image_size": [self._config.capture.width, self._config.capture.height],
+                    "image_size": list(self._config.logical_image_size),
                     "left_corners": left_corners.reshape(-1, 2).tolist(),
                     "right_corners": right_corners.reshape(-1, 2).tolist(),
                     "quality": {
@@ -207,13 +207,13 @@ class CalibrationService:
             snapshot.left_detection,
             self._config.checkerboard.corner_count,
             "left",
-            self._config.capture.image_size,
+            self._config.logical_image_size,
         )
         right = _validated_corners(
             snapshot.right_detection,
             self._config.checkerboard.corner_count,
             "right",
-            self._config.capture.image_size,
+            self._config.logical_image_size,
         )
         return snapshot.pair, left, right
 
@@ -304,7 +304,7 @@ class CalibrationService:
                     raise ServiceError("valid calibration sources are incomplete")
                 result = calibrate_observations(
                     observations,
-                    self._config.capture.image_size,
+                    self._config.logical_image_size,
                     self._config.minimum_pairs,
                 )
                 run_dir = write_calibration_run(
@@ -441,7 +441,8 @@ def _pair_has_expected_images(pair: FramePair | None, config: AppConfig) -> bool
 def _validated_pair_images(
     pair: FramePair, config: AppConfig
 ) -> tuple[NDArray[np.uint8], NDArray[np.uint8]]:
-    expected = (config.capture.height, config.capture.width, 3)
+    logical_width, logical_height = config.logical_image_size
+    expected = (logical_height, logical_width, 3)
     images: list[NDArray[np.uint8]] = []
     for side, image in (("left", pair.left), ("right", pair.right)):
         if (

@@ -27,11 +27,24 @@ LEFT_DEVICE = "/dev/v4l/by-path/pci-left-video-index0"
 RIGHT_DEVICE = "/dev/v4l/by-path/pci-right-video-index0"
 
 
-def make_config(*, controls: dict[str, int] | None = None) -> AppConfig:
+def make_config(
+    *,
+    controls: dict[str, int] | None = None,
+    left_rotation: int = 0,
+    right_rotation: int = 180,
+) -> AppConfig:
     return AppConfig.from_mapping(
         {
-            "left": {"name": "left", "device": LEFT_DEVICE, "rotation_degrees": 0},
-            "right": {"name": "right", "device": RIGHT_DEVICE, "rotation_degrees": 180},
+            "left": {
+                "name": "left",
+                "device": LEFT_DEVICE,
+                "rotation_degrees": left_rotation,
+            },
+            "right": {
+                "name": "right",
+                "device": RIGHT_DEVICE,
+                "rotation_degrees": right_rotation,
+            },
             "capture": {
                 "width": 4,
                 "height": 3,
@@ -411,6 +424,29 @@ def test_read_grabs_before_retrieve_normalizes_and_owns_frames(
     left_raw[:] = 0
     right_raw[:] = 0
     assert result.left.any() and result.right.any()
+    pair.close()
+
+
+def test_read_quarter_turns_to_the_shared_logical_dimensions() -> None:
+    left_raw = np.arange(36, dtype=np.uint8).reshape(3, 4, 3)
+    right_raw = (100 + np.arange(36, dtype=np.uint8)).reshape(3, 4, 3)
+    log: list[tuple] = []
+    pair, _, _, _ = configured_pair(
+        left=FakeCapture(LEFT_DEVICE, log, frame=left_raw),
+        right=FakeCapture(RIGHT_DEVICE, log, frame=right_raw),
+        config=make_config(left_rotation=270, right_rotation=90),
+    )
+    pair.open()
+
+    result = pair.read()
+
+    assert result.left.shape == result.right.shape == (4, 3, 3)
+    np.testing.assert_array_equal(
+        result.left, cv2.rotate(left_raw, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    )
+    np.testing.assert_array_equal(
+        result.right, cv2.rotate(right_raw, cv2.ROTATE_90_CLOCKWISE)
+    )
     pair.close()
 
 

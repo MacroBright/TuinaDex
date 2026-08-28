@@ -310,7 +310,7 @@ def write_calibration_run(
     skipped_pairs = _normalize_skip_diagnostics(
         skip_diagnostics, {pair.pair_id for pair in source_pairs}
     )
-    readable_sources = _load_preview_sources(source_pairs, config.capture.image_size)
+    readable_sources = _load_preview_sources(source_pairs, config.logical_image_size)
     if len(readable_sources) < 3:
         raise ValueError("at least 3 readable source pairs are required for previews")
 
@@ -327,7 +327,7 @@ def write_calibration_run(
             _write_yaml_artifact(
                 staging_dir / "stereo_calibration.yaml",
                 result,
-                config.capture.image_size,
+                config.logical_image_size,
                 [pair.pair_id for pair in source_pairs],
             )
             report = _build_report(result, config, source_pairs, skipped_pairs)
@@ -339,7 +339,7 @@ def write_calibration_run(
                 _report_markdown(report), encoding="utf-8"
             )
             _write_rectified_previews(staging_dir, result, readable_sources[:3])
-            _verify_artifacts(staging_dir, result, report, config.capture.image_size)
+            _verify_artifacts(staging_dir, result, report, config.logical_image_size)
             _fsync_artifacts(staging_dir)
             if _lstat_or_none(final_dir) is not None:
                 raise FileExistsError(f"calibration run already exists: {final_dir.name}")
@@ -416,7 +416,7 @@ def _validate_calibration_result(result: CalibrationResult, config: AppConfig) -
     """Reject malformed calibration data before artifact handling has side effects."""
     if not isinstance(result, CalibrationResult):
         raise ValueError("result must be a CalibrationResult")
-    width, height = _validate_image_size(config.capture.image_size)
+    width, height = _validate_image_size(config.logical_image_size)
     reference = config.baseline_reference_mm
     if not _is_plain_finite_number(reference) or reference <= 0:
         raise ValueError("baseline reference must be a positive finite number")

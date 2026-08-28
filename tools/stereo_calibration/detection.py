@@ -33,8 +33,12 @@ def normalize_frame(frame: NDArray[np.generic], rotation_degrees: int) -> NDArra
     """Normalize a captured frame to its configured orientation."""
     if rotation_degrees == 0:
         return frame
+    if rotation_degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     if rotation_degrees == 180:
         return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation_degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     raise ValueError(f"unsupported rotation: {rotation_degrees}")
 
 

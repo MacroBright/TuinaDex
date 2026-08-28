@@ -76,8 +76,8 @@ class CameraConfig:
         )
         if not camera.name:
             raise ConfigError("camera name must not be empty")
-        if camera.rotation_degrees not in (0, 180):
-            raise ConfigError("camera rotation must be 0 or 180 degrees")
+        if camera.rotation_degrees not in (0, 90, 180, 270):
+            raise ConfigError("camera rotation must be 0, 90, 180, or 270 degrees")
         return camera
 
 
@@ -138,6 +138,13 @@ class AppConfig:
     minimum_pairs: int
     target_pairs: int
     baseline_reference_mm: float
+
+    @property
+    def logical_image_size(self) -> tuple[int, int]:
+        """Return the shared post-rotation width and height."""
+        if self.left.rotation_degrees in (90, 270):
+            return self.capture.height, self.capture.width
+        return self.capture.image_size
 
     @classmethod
     def from_json(cls, path: Path | str) -> "AppConfig":
@@ -254,8 +261,13 @@ class AppConfig:
                 raise ConfigError("camera name must not be empty")
             _require_device_path(camera.device, "camera device")
             rotation = _require_integer(camera.rotation_degrees, "camera rotation")
-            if rotation not in (0, 180):
-                raise ConfigError("camera rotation must be 0 or 180 degrees")
+            if rotation not in (0, 90, 180, 270):
+                raise ConfigError("camera rotation must be 0, 90, 180, or 270 degrees")
+
+        left_is_quarter_turn = self.left.rotation_degrees in (90, 270)
+        right_is_quarter_turn = self.right.rotation_degrees in (90, 270)
+        if left_is_quarter_turn != right_is_quarter_turn:
+            raise ConfigError("left and right logical image dimensions must match")
 
         width = _require_integer(self.capture.width, "capture width")
         height = _require_integer(self.capture.height, "capture height")

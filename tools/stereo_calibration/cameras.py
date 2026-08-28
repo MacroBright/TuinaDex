@@ -321,11 +321,8 @@ class OpenCVCameraPair:
             normalized = normalize_frame(frame, rotation_degrees)
         except Exception as exc:
             raise CameraError(f"could not normalize {label} frame: {exc}") from exc
-        expected_shape = (
-            self._config.capture.height,
-            self._config.capture.width,
-            3,
-        )
+        logical_width, logical_height = self._config.logical_image_size
+        expected_shape = (logical_height, logical_width, 3)
         if normalized.shape != expected_shape:
             raise CameraError(
                 f"normalized {label} frame dimensions do not match {expected_shape}: "

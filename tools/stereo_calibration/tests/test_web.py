@@ -30,14 +30,24 @@ LEFT_DEVICE = "/dev/v4l/by-path/pci-left-video-index0"
 RIGHT_DEVICE = "/dev/v4l/by-path/pci-right-video-index0"
 
 
-def make_config(tmp_path: Path, *, minimum_pairs: int = 3) -> AppConfig:
+def make_config(
+    tmp_path: Path,
+    *,
+    minimum_pairs: int = 3,
+    left_rotation: int = 0,
+    right_rotation: int = 180,
+) -> AppConfig:
     return AppConfig.from_mapping(
         {
-            "left": {"name": "cam-left", "device": LEFT_DEVICE, "rotation_degrees": 0},
+            "left": {
+                "name": "cam-left",
+                "device": LEFT_DEVICE,
+                "rotation_degrees": left_rotation,
+            },
             "right": {
                 "name": "cam-right",
                 "device": RIGHT_DEVICE,
-                "rotation_degrees": 180,
+                "rotation_degrees": right_rotation,
             },
             "capture": {
                 "width": 160,
@@ -113,8 +123,13 @@ class FakeWorker:
         self.retry_calls += 1
 
 
-def make_service(tmp_path: Path, snapshot: WorkerSnapshot | None = None):
-    config = make_config(tmp_path)
+def make_service(
+    tmp_path: Path,
+    snapshot: WorkerSnapshot | None = None,
+    *,
+    config: AppConfig | None = None,
+):
+    config = config or make_config(tmp_path)
     store = SessionStore.create(config.data_root, "session-001")
     worker = FakeWorker(snapshot)
     return CalibrationService(worker, store, config), worker, store, config
@@ -225,6 +240,28 @@ def test_capture_saves_exact_snapshot_images_and_audit_metadata(tmp_path: Path) 
     assert metadata["quality"]["right"]["reasons"] == []
 
 
+def test_quarter_turn_service_uses_logical_dimensions_for_status_and_storage(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, left_rotation=270, right_rotation=90)
+    logical_left = np.zeros((160, 120, 3), dtype=np.uint8)
+    logical_right = np.zeros((160, 120, 3), dtype=np.uint8)
+    snapshot = replace(
+        good_snapshot(),
+        pair=FramePair(logical_left, logical_right, 1_000_000, 1_000_100),
+    )
+    service, _worker, store, _config = make_service(
+        tmp_path, snapshot, config=config
+    )
+
+    assert service.status()["can_capture"] is True
+    service.capture()
+
+    saved = store.active_pairs()[0]
+    assert cv2.imread(str(saved.left_path)).shape == (160, 120, 3)
+    assert saved.metadata["image_size"] == [120, 160]
+
+
 def test_capture_rejects_duplicate_worker_sequence_without_second_write(tmp_path: Path) -> None:
     service, _worker, store, _config = make_service(tmp_path)
     service.capture()
@@ -322,7 +359,8 @@ def add_active_pairs(store: SessionStore, count: int) -> None:
 def test_background_calibration_transitions_and_uses_exact_valid_sources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    service, _worker, store, config = make_service(tmp_path)
+    config = make_config(tmp_path, left_rotation=270, right_rotation=90)
+    service, _worker, store, config = make_service(tmp_path, config=config)
     add_active_pairs(store, 4)
     entered = threading.Event()
     release = threading.Event()
@@ -369,7 +407,7 @@ def test_background_calibration_transitions_and_uses_exact_valid_sources(
     release.set()
 
     completed = wait_for_state(service, "pass")["calibration"]
-    assert calls["calibrate"] == (observations, (160, 120), 3)
+    assert calls["calibrate"] == (observations, (120, 160), 3)
     assert calls["source_ids"] == [1, 2, 3]
     assert calls["skip_diagnostics"] == skipped
     assert completed["report_path"] == "results/run-001/report.json"

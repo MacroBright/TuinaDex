@@ -32,6 +32,23 @@ def test_normalize_frame_rotates_180_degrees() -> None:
     )
 
 
+def test_normalize_frame_rotates_90_degrees_clockwise() -> None:
+    frame = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
+
+    np.testing.assert_array_equal(
+        normalize_frame(frame, 90), cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    )
+
+
+def test_normalize_frame_rotates_270_degrees_counterclockwise() -> None:
+    frame = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
+
+    np.testing.assert_array_equal(
+        normalize_frame(frame, 270),
+        cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    )
+
+
 def test_normalize_frame_leaves_zero_rotation_unchanged() -> None:
     frame = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
 
@@ -41,8 +58,8 @@ def test_normalize_frame_leaves_zero_rotation_unchanged() -> None:
 def test_normalize_frame_rejects_unsupported_rotation() -> None:
     frame = np.zeros((2, 2, 3), dtype=np.uint8)
 
-    with pytest.raises(ValueError, match=r"^unsupported rotation: 90$"):
-        normalize_frame(frame, 90)
+    with pytest.raises(ValueError, match=r"^unsupported rotation: 45$"):
+        normalize_frame(frame, 45)
 
 
 def test_make_object_points_uses_row_major_millimetre_grid() -> None:

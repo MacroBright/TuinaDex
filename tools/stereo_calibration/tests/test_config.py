@@ -74,6 +74,37 @@ def test_right_camera_rotation_is_180(tmp_path: Path) -> None:
     assert config.right.rotation_degrees == 180
 
 
+def test_quarter_turn_cameras_swap_the_logical_image_size(tmp_path: Path) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping["left"]["rotation_degrees"] = 270
+    mapping["right"]["rotation_degrees"] = 90
+
+    config = AppConfig.from_mapping(mapping)
+
+    assert config.capture.image_size == (1280, 960)
+    assert config.logical_image_size == (960, 1280)
+
+
+def test_mixed_quarter_turn_parity_is_rejected(tmp_path: Path) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping["left"]["rotation_degrees"] = 90
+    mapping["right"]["rotation_degrees"] = 180
+
+    with pytest.raises(ConfigError, match="logical image dimensions"):
+        AppConfig.from_mapping(mapping)
+
+
+@pytest.mark.parametrize("rotation", [-90, 45, 360])
+def test_unsupported_integer_camera_rotation_is_rejected(
+    tmp_path: Path, rotation: int
+) -> None:
+    mapping = valid_mapping(tmp_path)
+    mapping["right"]["rotation_degrees"] = rotation
+
+    with pytest.raises(ConfigError, match="rotation"):
+        AppConfig.from_mapping(mapping)
+
+
 def test_fractional_camera_rotation_is_rejected(tmp_path: Path) -> None:
     mapping = valid_mapping(tmp_path)
     mapping["right"]["rotation_degrees"] = 180.9
