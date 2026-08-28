@@ -702,6 +702,24 @@ def test_baseline_warning_is_reported(tmp_path: Path) -> None:
     assert "基线警告：是" in (run_dir / "report.md").read_text(encoding="utf-8")
 
 
+def test_non_horizontal_translation_is_reported_and_warned(tmp_path: Path) -> None:
+    config = _artifact_config(tmp_path)
+    store = SessionStore.create(tmp_path, "vertical-baseline")
+    result = replace(
+        _artifact_result(),
+        translation=np.array([[-25.0], [210.0], [-40.0]], dtype=np.float64),
+    )
+
+    run_dir = write_calibration_run(store, result, config, _source_pairs(store))
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    markdown = (run_dir / "report.md").read_text(encoding="utf-8")
+
+    assert report["status"] == "warning"
+    assert report["metrics"]["translation_xyz_mm"] == [-25.0, 210.0, -40.0]
+    assert report["metrics"]["horizontal_baseline"] is False
+    assert "水平基线：否" in markdown
+
+
 @pytest.mark.parametrize(
     ("changes", "expected"),
     [

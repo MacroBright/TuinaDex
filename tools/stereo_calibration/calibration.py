@@ -792,6 +792,8 @@ def _build_report(
     skipped_pairs: Sequence[Mapping[str, str | int]] = (),
 ) -> dict[str, Any]:
     rms_max = max(result.left_rms, result.right_rms, result.stereo_rms)
+    tx, ty, tz = (float(value) for value in result.translation.reshape(3))
+    horizontal_baseline = abs(tx) > max(abs(ty), abs(tz))
     if not all(
         math.isfinite(value) and value >= 0
         for value in (
@@ -811,6 +813,7 @@ def _build_report(
     elif (
         result.vertical_error_median_px >= 1.0
         or result.vertical_error_p95_px >= 2.0
+        or not horizontal_baseline
     ):
         status = "warning"
     else:
@@ -847,6 +850,8 @@ def _build_report(
             "vertical_error_median_px": result.vertical_error_median_px,
             "vertical_error_p95_px": result.vertical_error_p95_px,
             "baseline_mm": result.baseline_mm,
+            "translation_xyz_mm": [tx, ty, tz],
+            "horizontal_baseline": horizontal_baseline,
         },
         "thresholds": {
             "rms_pass_max_px": 1.0,
@@ -902,6 +907,10 @@ def _report_markdown(report: dict[str, Any]) -> str:
         f"- 垂直误差中位数：{metrics['vertical_error_median_px']:.6f} px",
         f"- 垂直误差 P95：{metrics['vertical_error_p95_px']:.6f} px",
         f"- 基线长度：{metrics['baseline_mm']:.3f} mm",
+        "- 平移向量 X/Y/Z："
+        + ", ".join(f"{value:.3f}" for value in metrics["translation_xyz_mm"])
+        + " mm",
+        f"- 水平基线：{'是' if metrics['horizontal_baseline'] else '否'}",
         f"- 参考基线：{baseline['reference_mm']:.3f} mm",
         "",
         "## 数据与离群检查",
