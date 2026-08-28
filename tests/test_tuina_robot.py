@@ -1,4 +1,4 @@
-"""Unit tests for TuinaRobot LeRobot 0.4.4 BYOH integration."""
+"""Unit tests for TuinaRobot LeRobot 0.4.4 BYOH integration and safety gates."""
 
 import numpy as np
 import pytest
@@ -24,30 +24,31 @@ def test_tuina_robot_lifecycle_and_safety_gate():
     with pytest.raises(RuntimeError):
         robot.send_action(np.zeros(22, dtype=np.float32))
 
-    # 2. Connect -> SAFE_IDLE (not armed)
+    # 2. Connect -> SAFE_IDLE (starts poller, not armed)
     robot.connect()
     assert robot.is_connected is True
     assert robot.is_armed is False
 
+    # 3. get_observation from cache
     obs = robot.get_observation()
     assert "observation.state" in obs
     assert "observation.images.overhead_cam" in obs
     assert obs["observation.state"].shape == (22,)
 
-    # 3. send_action before arming -> returns safe hold
+    # 4. send_action before arming -> returns safe hold
     test_action = np.full(22, 0.5, dtype=np.float32)
     ret_action = robot.send_action(test_action)
-    assert np.allclose(ret_action, test_action)  # Returns without physical dispatch
+    assert np.allclose(ret_action, test_action)
 
-    # 4. Cannot arm without gravity confirmation
+    # 5. Cannot arm without gravity confirmation
     with pytest.raises(RuntimeError):
         robot.arm(gravity_confirmed=False)
 
-    # 5. Explicit arm
+    # 6. Explicit arm
     robot.arm(gravity_confirmed=True)
     assert robot.is_armed is True
 
-    # 6. send_action when armed
+    # 7. send_action when armed (measured dt and supervisor clamp)
     executed = robot.send_action(test_action)
     assert executed is not None
     if isinstance(executed, dict):
@@ -55,7 +56,25 @@ def test_tuina_robot_lifecycle_and_safety_gate():
     else:
         assert executed.shape == (22,)
 
-    # 7. Disconnect
+    # 8. Disconnect (stops pollers)
     robot.disconnect()
+    assert robot.is_connected is False
+    assert robot.is_armed is False
+
+
+def test_tuina_robot_real_mode_no_silent_fallback():
+    # In real mode without hardware, connect MUST fail with HARDWARE_FAULT
+    config = TuinaRobotConfig(
+        id="test_tuina_real_no_hardware",
+        can_interface="can_non_existent_999",
+        hand_serial_port="/dev/ttyUSB_NON_EXISTENT",
+        mock_mode=False,
+    )
+    robot = TuinaRobot(config)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        robot.connect()
+
+    assert "HARDWARE_FAULT" in str(exc_info.value)
     assert robot.is_connected is False
     assert robot.is_armed is False

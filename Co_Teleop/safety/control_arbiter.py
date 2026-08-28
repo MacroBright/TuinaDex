@@ -18,9 +18,11 @@ from typing import Optional
 class ControlSource(str, Enum):
     """动作控制源枚举."""
 
+    NONE = "NONE"                         # 未指定
     IDLE = "IDLE"                         # 无活动控制源 (安全待机态)
     HUMAN_TELEOP = "HUMAN_TELEOP"         # 人类操作员视觉手势遥操 (最高抢占权)
     VLA_POLICY = "VLA_POLICY"             # 策略网络自主推理 (SmolVLA / ACT / Diffusion)
+    DATASET_REPLAY = "DATASET_REPLAY"     # 数据集轨迹重放
     SCRIPT = "SCRIPT"                     # 预设脚本 / 复位回归动作 (如 Ready / Home 姿态)
 
 

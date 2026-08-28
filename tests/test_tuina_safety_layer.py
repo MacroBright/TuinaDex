@@ -56,17 +56,17 @@ def test_safety_layer_preemption_by_human():
     assert "HUMAN_TELEOP" in reason
 
 
-def test_safety_layer_clamping_dangerous_policy_action():
+def test_safety_layer_clamping_moderate_jump():
     arbiter = ControlArbiter()
-    supervisor = MotionSafetySupervisor(limits=SupervisorLimits(max_dq_rad=0.05))
+    supervisor = MotionSafetySupervisor(limits=SupervisorLimits(max_dq_rad=0.05, reject_dq_rad=1.0))
     safety_layer = TuinaSafetyLayer(arbiter=arbiter, supervisor=supervisor, alpha_smooth=1.0)
 
     curr_state = np.zeros(22, dtype=np.float32)
     safety_layer.reset(curr_state)
 
-    # Dangerous policy output: massive jump to 3.5 rad on Arm J1
+    # Moderate jump (0.4 rad < reject_dq 1.0)
     chunk = np.zeros((1, 22), dtype=np.float32)
-    chunk[0, 0] = 3.5
+    chunk[0, 0] = 0.4
 
     safe_target, granted, reason = safety_layer.process_policy_chunk(
         policy_action_chunk=chunk,
@@ -79,3 +79,27 @@ def test_safety_layer_clamping_dangerous_policy_action():
     assert safe_target is not None
     # Must be clamped by max_dq (0.05)
     assert safe_target[0] <= 0.06
+
+
+def test_safety_layer_rejecting_extreme_jump():
+    arbiter = ControlArbiter()
+    supervisor = MotionSafetySupervisor(limits=SupervisorLimits(max_dq_rad=0.05, reject_dq_rad=1.0))
+    safety_layer = TuinaSafetyLayer(arbiter=arbiter, supervisor=supervisor, alpha_smooth=1.0)
+
+    curr_state = np.zeros(22, dtype=np.float32)
+    safety_layer.reset(curr_state)
+
+    # Extreme jump (3.5 rad > reject_dq 1.0) -> must be rejected
+    chunk = np.zeros((1, 22), dtype=np.float32)
+    chunk[0, 0] = 3.5
+
+    safe_target, granted, reason = safety_layer.process_policy_chunk(
+        policy_action_chunk=chunk,
+        current_state_22d=curr_state,
+        dt=0.033,
+        now=100.0,
+    )
+
+    assert granted is False
+    assert safe_target is None
+    assert "REJECT" in reason

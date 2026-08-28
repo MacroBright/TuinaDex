@@ -17,41 +17,27 @@
 
 ## 📖 项目简介
 
-**TuinaDex** 是面向中医推拿（Tuina Massage）场景构建的 22 自由度双硬件协同具身智能系统：
+**TuinaDex** 是面向中医推拿（Tuina Massage）场景构建的 22 自由度双硬件协同具身智能数据采集、训练与部署系统：
 
-- **6-DOF 机械臂**：基于中大通 / Emm_V5 闭环步进电机，PC 通过 Linux 原生 **SocketCAN** 直连控制（500 kbps），提供宏观轨迹与姿态进近；
+- **6-DOF 机械臂**：基于闭环步进电机，PC 通过 Linux 原生 **SocketCAN** 直连控制（500 kbps），提供宏观轨迹与姿态进近；
 - **16-DOF 灵巧手**：集成 **LEAP Hand V1**，PC 通过 USB-TTL 串口直连 Dynamixel 舵机总线（4 Mbps），提供微观五指揉捏、抓捏与按压；
-- **单目深度视觉协同遥操 (`Co_Teleop`)**：单台 RealSense D455 深度相机同时解算人手宏观位姿与五指 21 关节点几何，配备 1280x720 宽屏 HUD 仪表盘与分级安全看门狗；
-- **LeRobot 具身智能闭环 (`Arm-robot_VLA`)**：无缝对接 Hugging Face LeRobot 数据采集格式，支持从遥操示教数据直接训练 SmolVLA / Diffusion Policy / ACT 策略模型。
+- **单目视觉协同遥操 (`Co_Teleop`)**：单台 RealSense D455 深度相机同时解算人手宏观位姿与五指 21 关节点几何，配备 1280x720 宽屏 HUD 仪表盘与分级安全看门狗；
+- **工作区感知与 37 穴位检测 (`AcuPointDet`)**：工业相机 + 华为昇腾 NPU (RTMDet + RTMPose)，实时输出背部 37 穴位结构化特征；
+- **LeRobot 具身智能闭环 (`packages/lerobot_robot_tuinadex`)**：无缝对接 Hugging Face LeRobot 0.4.4，支持从遥操示教数据直接训练 SmolVLA / ACT 策略模型并进行真机慢速重放质检。
 
 ---
 
-## 🏗 系统架构
+## 🏗 系统架构 (Three-Loop 异步多速率架构)
 
 ```text
-                     【Intel RealSense D455 深度感知流】
-                                     │
-                    【MediaPipe 3D 手势关键点检测】
-                                     │
-            ┌────────────────────────┴────────────────────────┐
-            ▼                                                 ▼
-   【6-DOF 机械臂宏观位姿解耦】                      【16-DOF 灵巧手微观几何映射】
-   • 刚体掌骨基准解算 (Wrist / MCPs)                 • 5 指 21 关节点向量夹角
-   • 手腕空间位移 → 笛卡尔线速度 (vx, vy, vz)         • 指尖屈伸/侧摆 → 16 舵机目标弧度
-   • 掌面倾斜偏角 → 虚拟摇杆角速度 (wx, wy, wz)       • 柔顺电流限制 + 1€ 滤波
-            │                                                 │
-            ▼                                                 ▼
-   【四级安全看门狗 VisionWatchdog】                  【丢失渐进松开保护 relax_step】
-   (OK / DECAY / STOP / ESTOP)                                │
-            │                                                 │
-            ▼                                                 ▼
-   【6-DOF 闭环笛卡尔控制器 (SocketCAN)】            【LEAP Hand 实体驱动 (Dynamixel 4Mbps)】
-            │                                                 │
-            └────────────────────────┬────────────────────────┘
-                                     │
-                                     ▼
-                    【LeRobot 数据集录制 / 策略闭环】
-                    (22-DOF Joint State & Action @ 30Hz)
+ 1. Control Loop (50Hz / 20ms)
+    D455 / Policy ──> ControlArbiter (租约仲裁) ──> MotionSafetySupervisor (3级裁决) ──> SocketCAN & UART
+
+ 2. Perception Loop (20~30Hz)
+    推拿工作区工业相机 ──> AcuPointWorker (追最新帧) ──> RTMDet + RTMPose (37 穴位) ──> LatestStateCache
+
+ 3. Dataset Loop (30Hz)
+    LatestStateCache.snapshot() ──> ObservationAggregator ──> TeleopFrame ──> LeRobotWriter (Parquet + AV1)
 ```
 
 ---

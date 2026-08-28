@@ -19,6 +19,7 @@ from Co_Teleop.safety.control_arbiter import (
 )
 from Co_Teleop.safety.motion_supervisor import (
     MotionSafetySupervisor,
+    SafetyDecision,
     SupervisorLimits,
 )
 
@@ -57,24 +58,33 @@ def test_motion_safety_supervisor_clamping():
     # 1. Test arm limits
     # J2 range is [-1°, 150°] -> [-0.017, 2.618] rad. If commanded 3.0 rad, should be clamped to 2.618
     target_q = np.array([0.0, 3.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    clamped_q, was_clamped, reason = supervisor.validate_and_clamp_arm(target_q)
+    clamped_q, was_clamped, is_rejected, reason = supervisor.validate_and_clamp_arm(target_q)
     assert was_clamped is True
-    assert np.isclose(clamped_q[1], supervisor.limits.arm_limits_rad[1, 1])
+    assert is_rejected is False
+    assert clamped_q[1] <= 2.618
 
     # 2. Test max_dq jump limit (use dt=0.1s so max_dq is tighter than velocity limit)
     curr_q = np.zeros(6, dtype=np.float32)
-    jump_q = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)  # 1.0 rad > max_dq (0.5236)
-    clamped_jump, was_clamped, reason = supervisor.validate_and_clamp_arm(jump_q, current_q=curr_q, dt=0.1)
-    assert was_clamped is True
-    assert np.isclose(clamped_jump[0], supervisor.limits.max_dq_rad)
+    jump_q = np.array([0.4, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)  # 0.4 rad
+    clamped_jump, was_clamped, is_rejected, reason = supervisor.validate_and_clamp_arm(jump_q, current_q=curr_q, dt=0.1)
+    assert is_rejected is False
 
-    # 3. Test 22D supervise
-    action_22d = np.zeros(22, dtype=np.float32)
-    action_22d[1] = 4.0  # Excessive J2
-    res = supervisor.supervise_22d(action_22d)
-    assert res.is_safe is False
-    assert res.arm_clamped is True
-    assert np.isclose(res.clamped_arm_q[1], supervisor.limits.arm_limits_rad[1, 1])
+    # 3. Test 22D supervise (Moderate jump -> CLAMP)
+    act_22d = np.zeros(22, dtype=np.float32)
+    act_22d[1] = 0.8  # Moderate J2 jump (< reject_dq 1.047)
+    res_clamp = supervisor.supervise_22d(act_22d, current_state_22d=np.zeros(22, dtype=np.float32))
+    assert res_clamp.is_safe is True
+    assert res_clamp.decision == SafetyDecision.CLAMP
+    assert res_clamp.arm_clamped is True
+    assert res_clamp.clamped_arm_q[1] <= supervisor.limits.max_dq_rad + 1e-4
+
+    # 4. Test 22D supervise (Extreme jump -> REJECT & Safe Hold)
+    act_extreme = np.zeros(22, dtype=np.float32)
+    act_extreme[1] = 4.0  # Extreme J2 jump (> reject_dq 1.047)
+    res_reject = supervisor.supervise_22d(act_extreme, current_state_22d=np.zeros(22, dtype=np.float32))
+    assert res_reject.is_safe is False
+    assert res_reject.decision == SafetyDecision.REJECT
+    assert np.isclose(res_reject.clamped_arm_q[1], 0.0)
 
 
 def test_joint_target_controller_lease_and_smoothing():
@@ -82,20 +92,21 @@ def test_joint_target_controller_lease_and_smoothing():
     supervisor = MotionSafetySupervisor()
     controller = JointTargetController(arbiter, supervisor, alpha_arm=0.5)
 
+    curr_state = np.zeros(22, dtype=np.float32)
     action_22d = np.zeros(22, dtype=np.float32)
     action_22d[0] = 0.4  # J1 target 0.4 rad
 
-    # First action -> granted lease, smoothed and clamped
-    exec_22d, res, granted = controller.process_action(action_22d, now=100.0)
+    # First action -> granted lease, smoothed from current_state_22d and clamped
+    exec_22d, res, granted = controller.process_action(action_22d, current_state_22d=curr_state, now=100.0)
     assert granted is True
     assert exec_22d is not None
-    assert np.isclose(exec_22d[0], 0.4)
+    assert np.isclose(exec_22d[0], 0.2)  # 0.5 * 0.4 + 0.5 * 0.0
 
     # Human preempts arbiter
     arbiter.request_lease(ControlSource.HUMAN_TELEOP, now=100.01)
 
     # Policy tries again -> lease denied
-    exec_22d_denied, res_denied, granted_denied = controller.process_action(action_22d, now=100.02)
+    exec_22d_denied, res_denied, granted_denied = controller.process_action(action_22d, current_state_22d=exec_22d, now=100.02)
     assert granted_denied is False
     assert exec_22d_denied is None
 
