@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import numpy as np
 
+import logging
+from typing import Optional
+
+from lerobot_robot_massage.zdt.safety import SafetyError
 from lerobot_robot_massage.zdt.types import (
     CartesianCommand, EEPose, JointState,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SimulationArmAdapter:
@@ -75,13 +81,18 @@ class NoDriveArmAdapter:
         self._phase = "SAFE_IDLE"
 
     def arm(self, gravity_confirmed: bool = False) -> None:
+        if not gravity_confirmed:
+            raise SafetyError("重力关节需显式确认")
         self._phase = "ARMED"
 
     def enter_teleop(self) -> None:
+        if self._phase != "ARMED":
+            raise SafetyError(f"非 ARMED 状态 ({self._phase}) 不得进入 TELEOP")
         self._phase = "TELEOP"
 
     def exit_teleop(self) -> None:
-        self._phase = "ARMED"
+        if self._phase == "TELEOP":
+            self._phase = "ARMED"
 
     def disconnect(self) -> None:
         self._phase = "DISCONNECTED"
@@ -103,15 +114,19 @@ class NoDriveArmAdapter:
         pass
 
     def re_arm(self, gravity_confirmed: bool = True) -> None:
-        if self._phase == "STOPPED":
+        if self._phase in ("STOPPED", "FAULT"):
+            if not gravity_confirmed:
+                raise SafetyError("re_arm 需重力确认")
             self._phase = "TELEOP"
 
     def ready(self) -> None:
-        self._phase = "TELEOP"
+        if self._phase not in ("ARMED", "TELEOP"):
+            raise SafetyError(f"非 ARMED/TELEOP 状态 ({self._phase}) 禁止执行 ready 运动")
         self._q = list(self.ready_pose)
 
     def home(self) -> None:
-        self._phase = "TELEOP"
+        if self._phase not in ("ARMED", "TELEOP"):
+            raise SafetyError(f"非 ARMED/TELEOP 状态 ({self._phase}) 禁止执行 home 运动")
         self._q = list(self.home_pose)
 
     def reset(self) -> None:
@@ -164,17 +179,15 @@ class RealArmAdapter:
 
     def re_arm(self, gravity_confirmed: bool = True) -> None:
         """从 STOPPED / FAULT 状态安全恢复至 ARMED / TELEOP 状态."""
-        try:
-            if self._ctrl.robot.phase.name in ("STOPPED", "FAULT"):
-                self._ctrl.robot.re_arm(confirmed=True)
-                self._ctrl.arm(gravity_confirmed=gravity_confirmed)
+        if hasattr(self._ctrl, "robot") and self._ctrl.robot.phase.name in ("STOPPED", "FAULT"):
+            self._ctrl.re_arm(confirmed=True)
+            if gravity_confirmed:
+                self._ctrl.arm(gravity_confirmed=True)
                 self._ctrl.enter_teleop()
-        except Exception:
-            pass
 
     def disconnect(self) -> None:
         try:
-            if self._ctrl.robot.phase.name in ("ARMED", "TELEOP"):
+            if hasattr(self._ctrl, "robot") and self._ctrl.robot.phase.name in ("ARMED", "TELEOP"):
                 self._ctrl.disarm()
         except Exception:
             pass
@@ -185,16 +198,40 @@ class RealArmAdapter:
                 pass
 
     def get_joint_state(self) -> JointState:
-        if hasattr(self._cart, "_q_tracked") and self._cart._q_tracked is not None:
-            q = list(self._cart._q_tracked)
-        elif hasattr(self._ctrl, "_tracked_angles") and self._ctrl._tracked_angles is not None:
-            q = list(self._ctrl._tracked_angles)
-        else:
-            q = [0.0] * 6
-        return JointState(q=tuple(q), dq=(0.0,) * 6,
-                          current_ma=(0.0,) * 6,
-                          flags=(0,) * 6,
-                          status=self._ctrl.robot.phase.name)
+        """获取真实机械臂 Observation (spec §5.3 / fix.md).
+
+        优先通过 ZdtController.get_real_state() 读取 6 轴真实状态:
+          q: 0x36 真实输出角 (anchor 帧, deg)
+          dq: 一阶低通有限差分速度 (deg/s)
+          current_ma: 6 轴实时电机相电流 (mA)
+          flags: 6 轴电机硬件状态字
+          status: 机械臂生命周期状态名
+        若底层尚未连接或通信异常，降级使用跟踪值并打印告警。
+        """
+        try:
+            real = self._ctrl.get_real_state()
+            return JointState(
+                q=tuple(real["q"]),
+                dq=tuple(real["velocity"]),
+                current_ma=tuple(real["current"]),
+                flags=tuple(real["flags"]),
+                status=real["status"],
+            )
+        except Exception as e:
+            logger.warning("get_real_state() 读取失败，降级为软件跟踪值: %s", e)
+            if hasattr(self._cart, "_q_tracked") and self._cart._q_tracked is not None:
+                q = list(self._cart._q_tracked)
+            elif hasattr(self._ctrl, "_tracked_angles") and self._ctrl._tracked_angles is not None:
+                q = list(self._ctrl._tracked_angles)
+            else:
+                q = [0.0] * 6
+            return JointState(
+                q=tuple(q),
+                dq=(0.0,) * 6,
+                current_ma=(),
+                flags=(),
+                status=self._ctrl.robot.phase.name if hasattr(self._ctrl, "robot") else "UNKNOWN",
+            )
 
     def get_real_joint_angles(self) -> list[float]:
         return self._ctrl.read_real_angles(use_kb=True)
@@ -212,12 +249,16 @@ class RealArmAdapter:
 
     def ready(self) -> None:
         """安全运动至按摩准备姿态 (配置 target_pose 或 READY_POSE_DEG), 100 RPM 同步."""
-        self.re_arm(gravity_confirmed=True)
+        phase = self._ctrl.robot.phase.name if hasattr(self._ctrl, "robot") else ""
+        if phase not in ("ARMED", "TELEOP"):
+            raise SafetyError(f"非 ARMED/TELEOP 状态 ({phase}) 禁止执行 ready 运动")
         self._cart.ready(target_angles_deg=self.ready_pose)
 
     def home(self) -> None:
         """安全运动回上电初始姿态 (配置 target_pose 或 JOINT_INIT_ANGLE_DEG), 100 RPM 同步."""
-        self.re_arm(gravity_confirmed=True)
+        phase = self._ctrl.robot.phase.name if hasattr(self._ctrl, "robot") else ""
+        if phase not in ("ARMED", "TELEOP"):
+            raise SafetyError(f"非 ARMED/TELEOP 状态 ({phase}) 禁止执行 home 运动")
         self._cart.home(target_angles_deg=self.home_pose)
 
     def reset(self) -> None:

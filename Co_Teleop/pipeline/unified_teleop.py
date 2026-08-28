@@ -148,7 +148,7 @@ def main():
                                      home_pose=teleop_cfg.pose.home_pose_deg)
         print(f"[机械臂] 正在连接 SocketCAN ({args.iface}) 并初始化 6 个电机...")
         arm_adapter.connect()
-        arm_adapter.arm(gravity_confirmed=True)
+        arm_adapter.arm(gravity_confirmed=args.gravity_confirm)
         arm_adapter.enter_teleop()
         print(f"[机械臂] 6-DOF 电机已成功上电使能 (状态: {arm_adapter.state()}, 请按 R 键开始运动至准备姿态)")
 
@@ -518,8 +518,8 @@ def main():
                 smooth_v_base[0] = np.zeros(3)
                 smooth_w_base[0] = np.zeros(3)
                 last_wrist[0] = None
-                if arm_adapter.state() == "STOPPED":
-                    arm_adapter.arm(gravity_confirmed=True)
+                if arm_adapter.state() in ("STOPPED", "FAULT"):
+                    arm_adapter.re_arm(gravity_confirmed=True)
                 print("\n  *** 视觉看门狗已手动复位并重新使能 (Watchdog Reset & Re-armed)! ***\n")
             elif k in (ord("k"), ord("K")):
                 # K: 灵巧手五指全开校准并使能上电

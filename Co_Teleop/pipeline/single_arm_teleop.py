@@ -766,9 +766,10 @@ def main():
                            deadband_rad_s=0.0005,
                            default_clutch_active=False)
     adapter.connect()
-    adapter.arm(gravity_confirmed=True)
-    adapter.enter_teleop()
-    adapter.ready()
+    if not args.no_drive:
+        adapter.arm(gravity_confirmed=args.gravity_confirm)
+        adapter.enter_teleop()
+        adapter.ready()
     recorder.start_episode()
     WIN_NAME = "RealArmTeleop 6DOF"
     cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)

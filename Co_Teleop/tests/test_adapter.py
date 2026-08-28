@@ -149,6 +149,48 @@ def test_no_drive_adapter_lifecycle():
     assert a.state() == "DISCONNECTED"
 
 
+def test_real_adapter_joint_state_real_feedback():
+    adapter, t, clock = _real_adapter()
+    _inject_anchor_pose(t, READY_ANCHOR)
+    # 注入电流帧 (0x27) 与 状态字帧 (0x3A) 需按顺序逐轮入队 (FIFO)
+    for addr in ADDRS:
+        t.inject(addr, 0x27, bytes([0x00, 0x64]) + b"\x6b")  # 100 mA
+    for addr in ADDRS:
+        t.inject(addr, 0x3A, bytes([0x02]) + b"\x6b")        # flags=2
+    js = adapter.get_joint_state()
+    np.testing.assert_allclose(js.q, READY_ANCHOR, atol=1e-2)
+    assert len(js.dq) == 6
+    assert len(js.current_ma) == 6
+    assert len(js.flags) == 6
+    assert js.status == "ARMED"
+    assert all(c == 100.0 for c in js.current_ma)
+    assert all(f == 2 for f in js.flags)
+
+
+def test_real_adapter_ready_home_requires_armed():
+    import pytest
+    from lerobot_robot_massage.zdt.safety import SafetyError
+    t = FakeTransport()
+    cfg = ZdtConfig(timeout_s=0.001, retries=0, reduction_ratios=[1.0] * 6,
+                    calib=[(1.0, 0.0)] * 6)
+    ctrl = ZdtController(config=cfg, transport=t)
+    for addr in range(0x01, 0x07):
+        t.inject(addr, 0x1F, bytes([0x00, 0x01, 0x01]) + b"\x6b")
+    for addr in range(0x01, 0x07):
+        t.inject(addr, F_READ_POS, b"\x00\x00\x00\x00\x00" + b"\x6b")
+    adapter = RealArmAdapter(ctrl)
+    adapter.connect()
+    assert adapter.state() == "SAFE_IDLE"
+    with pytest.raises(SafetyError):
+        adapter.ready()
+    with pytest.raises(SafetyError):
+        adapter.home()
+    with pytest.raises(SafetyError):
+        adapter.arm(gravity_confirmed=False)
+    adapter.arm(gravity_confirmed=True)
+    assert adapter.state() == "ARMED"
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
