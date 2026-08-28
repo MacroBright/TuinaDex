@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_tuinadex"
+version = "0.1.0"
+description = "LeRobot BYOH Hardware Plugin for TuinaDex 22-DOF Massage Arm & LEAP Hand"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[project.entry-points."lerobot.robots"]
+tuinadex = "lerobot_robot_tuinadex:TuinaRobot"

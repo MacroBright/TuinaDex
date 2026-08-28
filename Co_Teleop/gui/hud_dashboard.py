@@ -36,8 +36,12 @@ def draw_unified_dashboard(
     hand_angles: np.ndarray | None = None,
     hand_bent: list[bool] | None = None,
     fps: float = 0.0,
+    recording_info: dict | None = None,
+    overhead_image: np.ndarray | None = None,
+    acupoint_info: dict | None = None,
+    lease_info: str | None = None,
 ) -> None:
-    """在全视野 1280x720 画面上绘制专业现代科技风 HUD 仪表盘."""
+    """在全视野 1280x720 画面上绘制专业现代科技风 HUD 仪表盘 (支持 LeRobot 录制与穴位多模态)."""
     h, w = frame.shape[:2]
 
     # 1. 绘制半透明黑色背景遮罩 (HUD 卡片底色)
@@ -76,14 +80,27 @@ def draw_unified_dashboard(
 
     # 3. 顶部 Header 状态栏内容
     if clutch_active:
-        cv2.rectangle(frame, (10, 7), (140, 37), (0, 180, 80), -1)
-        cv2.putText(frame, "[SPACE] RUN", (16, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+        cv2.rectangle(frame, (10, 7), (130, 37), (0, 180, 80), -1)
+        cv2.putText(frame, "[SPACE] RUN", (14, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
     else:
-        cv2.rectangle(frame, (10, 7), (140, 37), (40, 40, 200), -1)
-        cv2.putText(frame, "[SPACE] PAUSE", (14, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
+        cv2.rectangle(frame, (10, 7), (130, 37), (40, 40, 200), -1)
+        cv2.putText(frame, "[SPACE] PAUSE", (12, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 2)
+
+    # 录制状态标识
+    rec_is_on = recording_info.get("is_recording", False) if recording_info else False
+    if rec_is_on:
+        ep_idx = recording_info.get("episode_idx", 1)
+        frames = recording_info.get("frames", 0)
+        t_name = recording_info.get("task_name", "按揉大椎穴")
+        cv2.rectangle(frame, (140, 7), (350, 37), (0, 0, 200), -1)
+        cv2.circle(frame, (155, 22), 6, (0, 255, 255), -1)
+        cv2.putText(frame, f"REC Ep#{ep_idx} ({frames}f)", (168, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 2)
+    else:
+        cv2.rectangle(frame, (140, 7), (270, 37), (40, 45, 50), -1)
+        cv2.putText(frame, "[G] STANDBY", (148, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (180, 180, 180), 1)
 
     # 机械臂模式
-    cv2.putText(frame, f"ARM: {MODE_NAMES.get(arm_mode, 'Knead')}", (155, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 255), 2)
+    cv2.putText(frame, f"ARM:{MODE_NAMES.get(arm_mode, 'Knead')[:5]}", (360, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 2)
 
     # 档位徽标
     badge_col = gear_info.get("color", (0, 220, 255))
@@ -93,9 +110,12 @@ def draw_unified_dashboard(
 
     # 灵巧手状态
     hand_col = (0, 255, 120) if "POWERED" in hand_state_str else (160, 160, 160)
-    cv2.putText(frame, f"HAND: {hand_state_str}", (615, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.52, hand_col, 2)
-    cv2.putText(frame, f"3D: {source_name}", (845, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 200, 255), 1)
-    cv2.putText(frame, f"{fps:3.0f} FPS", (w - 95, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 180) if fps >= 45 else (220, 220, 220), 2)
+    cv2.putText(frame, f"HAND: {hand_state_str}", (610, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.48, hand_col, 2)
+
+    # 控制租约状态
+    lease_str = lease_info or "HUMAN"
+    cv2.putText(frame, f"LEASE:{lease_str}", (810, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255) if lease_str == "HUMAN" else (255, 200, 0), 2)
+    cv2.putText(frame, f"{fps:3.0f} FPS", (w - 90, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 180) if fps >= 45 else (220, 220, 220), 2)
 
     # 4. 左上紧凑动作姿态面板 (Motion & Attitude Panel)
     cv2.putText(frame, "MOTION & ATTITUDE", (lx0 + 8, ly0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 230, 255), 1)
@@ -168,7 +188,7 @@ def draw_unified_dashboard(
                 cv2.rectangle(frame, (bx, by), (bx + bar_w, by + 8), (0, 220, 255), -1)
                 cv2.putText(frame, f"M{motor_id}", (bx, by - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.24, (160, 160, 160), 1)
 
-    # 7. 手腕锚定标记与动态运动引导箭头 (Wrist Movement Arrow)
+    # 7. 手腕锚定标记与动态运动引导箭头
     wrist_px = arm_out.get("wrist_px")
     if wrist_px is not None:
         u, v = int(wrist_px[0]), int(wrist_px[1])
@@ -184,6 +204,6 @@ def draw_unified_dashboard(
                 cv2.putText(frame, f"{v_mag:.0f} mm/s", (u + dx + 6, v + dy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
 
-    # 8. 底部操作提示栏
-    cv2.putText(frame, "SPACE: Arm Pause | R: Ready | H: Home | L: Hand Pause | Z: Zero | W: WD Reset | K: Calib | S/TAB: Gear | Q: Quit",
-                (12, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+    # 8. 底部快捷操作提示栏
+    cv2.putText(frame, "SPACE: Arm Pause | G: Rec/Save | X: Discard Ep | F1~F4: Technique | R: Ready | H: Home | L: Hand Lock | Q: Quit",
+                (12, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1)
