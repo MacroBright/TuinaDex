@@ -272,6 +272,50 @@ def test_capture_rejects_duplicate_worker_sequence_without_second_write(tmp_path
     assert len(store.active_pairs()) == 1
 
 
+def shifted_detection(offset_px: float) -> DetectionResult:
+    corners = good_corners() + np.array([[[offset_px, 0.0]]], dtype=np.float32)
+    return detection(corners=corners)
+
+
+def test_consecutive_duplicate_pose_is_blocked_in_status_and_capture(
+    tmp_path: Path,
+) -> None:
+    service, worker, store, _config = make_service(tmp_path)
+    service.capture()
+    worker.current = replace(
+        good_snapshot(sequence=8),
+        left_detection=shifted_detection(0.0),
+        right_detection=shifted_detection(20.0),
+    )
+
+    status = service.status()
+
+    assert status["can_capture"] is False
+    assert status["capture_blocker"] == (
+        "与上一组过于相似，请明显移动、倾斜或改变距离"
+    )
+    with pytest.raises(ServiceError, match="过于相似"):
+        service.capture()
+    assert len(store.active_pairs()) == 1
+
+
+def test_pose_change_at_threshold_is_saveable(tmp_path: Path) -> None:
+    service, worker, store, _config = make_service(tmp_path)
+    service.capture()
+    worker.current = replace(
+        good_snapshot(sequence=8),
+        left_detection=shifted_detection(15.0),
+        right_detection=shifted_detection(15.0),
+    )
+
+    status = service.status()
+
+    assert status["can_capture"] is True
+    assert status["capture_blocker"] is None
+    service.capture()
+    assert [pair.pair_id for pair in store.active_pairs()] == [1, 2]
+
+
 @pytest.mark.parametrize(
     "bad_snapshot",
     [
@@ -324,7 +368,12 @@ def test_reject_last_and_retry_translate_operations_without_mutating_other_data(
 ) -> None:
     service, worker, store, _config = make_service(tmp_path)
     service.capture()
-    worker.current = replace(worker.current, sequence=8)
+    worker.current = replace(
+        worker.current,
+        sequence=8,
+        left_detection=shifted_detection(20.0),
+        right_detection=shifted_detection(20.0),
+    )
     service.capture()
 
     rejected = service.reject_last()
@@ -838,7 +887,7 @@ def test_index_is_self_contained_safe_chinese_guided_interface() -> None:
         "移除上一组",
         "重新连接相机",
         "开始标定",
-        "标定板停止移动后再保存",
+        "与上一组过于相似",
         "中心",
         "四个角",
         "相反方向倾斜",
@@ -853,5 +902,6 @@ def test_index_is_self_contained_safe_chinese_guided_interface() -> None:
     assert "fetch('/" not in text
     assert "api/status" in text
     assert "api/preview.jpg" in text
+    assert 'id="capture-blocker"' in text
     assert "200" in text
     assert "new Image" not in text  # one reusable preview element, no piling image objects

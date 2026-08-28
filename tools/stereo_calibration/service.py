@@ -29,6 +29,8 @@ class ServiceError(RuntimeError):
 
 
 _ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s:;,]+/?)+")
+_DUPLICATE_POSE_MESSAGE = "与上一组过于相似，请明显移动、倾斜或改变距离"
+_MINIMUM_POSE_CHANGE_PX = 15.0
 
 
 class CalibrationService:
@@ -52,7 +54,8 @@ class CalibrationService:
         """Return one coherent, JSON-safe view of cameras, session, and job state."""
         try:
             snapshot = self._worker.snapshot()
-            active_count = len(self._session.active_pairs())
+            active_pairs = self._session.active_pairs()
+            active_count = len(active_pairs)
         except Exception as exc:
             raise ServiceError(f"could not read service status: {_safe_detail(exc)}") from exc
 
@@ -75,9 +78,18 @@ class CalibrationService:
             self._config.checkerboard.corner_count,
             self._config.logical_image_size,
         )
-        can_capture = bool(
+        base_capture_ready = bool(
             snapshot.error is None and complete_pair and left_ready and right_ready
         )
+        capture_blocker = None
+        if base_capture_ready:
+            capture_blocker = _duplicate_pose_blocker(
+                snapshot.left_detection,
+                snapshot.right_detection,
+                active_pairs,
+                self._config.checkerboard.corner_count,
+            )
+        can_capture = base_capture_ready and capture_blocker is None
         left_status = _camera_status(
             self._config.left, snapshot.left_detection, snapshot
         )
@@ -90,6 +102,7 @@ class CalibrationService:
             "active_count": active_count,
             "target_pairs": self._config.target_pairs,
             "can_capture": can_capture,
+            "capture_blocker": capture_blocker,
             "camera_error": None
             if snapshot.error is None
             else _public_text(snapshot.error),
@@ -168,6 +181,14 @@ class CalibrationService:
                 raise ServiceError(f"worker sequence {sequence} was already captured")
             try:
                 pair, left_corners, right_corners = self._validated_capture(snapshot)
+                duplicate_blocker = _duplicate_pose_blocker_from_corners(
+                    left_corners,
+                    right_corners,
+                    self._session.active_pairs(),
+                    self._config.checkerboard.corner_count,
+                )
+                if duplicate_blocker is not None:
+                    raise ServiceError(duplicate_blocker)
                 metadata = {
                     "worker_sequence": sequence,
                     "timestamps_ns": {
@@ -380,6 +401,56 @@ def _audit_quality(detection: DetectionResult | None) -> dict[str, Any]:
         "border_ok": bool(detection.border_ok),
         "reasons": [_sanitize_text(reason) for reason in detection.reasons],
     }
+
+
+def _duplicate_pose_blocker(
+    left_detection: DetectionResult | None,
+    right_detection: DetectionResult | None,
+    active_pairs: list[SavedPair],
+    expected_count: int,
+) -> str | None:
+    if left_detection is None or right_detection is None:
+        return None
+    return _duplicate_pose_blocker_from_corners(
+        left_detection.corners,
+        right_detection.corners,
+        active_pairs,
+        expected_count,
+    )
+
+
+def _duplicate_pose_blocker_from_corners(
+    left_corners: NDArray[np.float32] | None,
+    right_corners: NDArray[np.float32] | None,
+    active_pairs: list[SavedPair],
+    expected_count: int,
+) -> str | None:
+    if not active_pairs:
+        return None
+    if left_corners is None or right_corners is None:
+        return None
+    previous = active_pairs[-1].metadata
+    previous_left = _previous_pose_corners(previous, "left_corners", expected_count)
+    previous_right = _previous_pose_corners(previous, "right_corners", expected_count)
+    current_left = np.asarray(left_corners, dtype=np.float32).reshape(-1, 2)
+    current_right = np.asarray(right_corners, dtype=np.float32).reshape(-1, 2)
+    left_change = float(np.median(np.linalg.norm(current_left - previous_left, axis=1)))
+    right_change = float(np.median(np.linalg.norm(current_right - previous_right, axis=1)))
+    if min(left_change, right_change) < _MINIMUM_POSE_CHANGE_PX:
+        return _DUPLICATE_POSE_MESSAGE
+    return None
+
+
+def _previous_pose_corners(
+    metadata: dict[str, Any], key: str, expected_count: int
+) -> NDArray[np.float32]:
+    try:
+        corners = np.asarray(metadata[key], dtype=np.float32)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ServiceError(f"previous pose {key} is invalid") from exc
+    if corners.shape != (expected_count, 2) or not np.all(np.isfinite(corners)):
+        raise ServiceError(f"previous pose {key} is invalid")
+    return corners
 
 
 def _detection_is_capture_ready(

@@ -72,7 +72,7 @@
 
   <section class="panel hint">
     <strong>下一组建议：</strong><span id="sampling-hint">先将棋盘格放在画面中心</span>
-    <div class="stop">请让标定板停止移动后再保存！</div>
+    <div class="stop" id="capture-blocker">保存前请保持标定板静止；与上一组过于相似时按钮会禁用。</div>
   </section>
 
   <section class="panel actions">
@@ -152,6 +152,7 @@
       byId("pair-progress").max = data.target_pairs;
       byId("pair-progress").value = data.active_count;
       canCapture = Boolean(data.can_capture);
+      byId("capture-blocker").textContent = data.capture_blocker || "保存前请保持标定板静止";
       const calibration = data.calibration;
       byId("calibration-state").textContent = calibration.state;
       byId("report-path").textContent = calibration.report_path || "暂无";
