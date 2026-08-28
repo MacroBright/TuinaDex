@@ -46,13 +46,15 @@ ls -l \
 只打开、读取一组并关闭相机，不创建会话：
 
 ```bash
-cd ~/projects/TuinaDex
+cd ~/projects/TuinaDex-stereo-calibration
 python -m tools.stereo_calibration.main \
-  --config ~/.config/tuinadex/stereo-dry-run.json \
+  --config ~/.config/tuinadex/stereo-upright-dry-run.json \
   --check-cameras
 ```
 
-通过时应显示 `1280x960` 且右相机逻辑旋转为 `180°`。如果分辨率、MJPG、30 FPS 或 V4L2 回读不匹配，工具会拒绝进入正式采集。
+相机设备仍以 `1280x960`、MJPG、30 FPS 读取；数字转正后应显示逻辑画面
+`960x1280`，左相机旋转 `270°`、右相机旋转 `90°`。如果设备回读或逻辑尺寸不匹配，
+工具会拒绝进入正式采集。
 
 ## 5. 启动命令与预期输出
 
@@ -61,8 +63,8 @@ python -m tools.stereo_calibration.main \
 ```bash
 mkdir -p ~/.config/tuinadex
 cp tools/stereo_calibration/example_config.json \
-  ~/.config/tuinadex/stereo-dry-run.json
-nano ~/.config/tuinadex/stereo-dry-run.json
+  ~/.config/tuinadex/stereo-upright-dry-run.json
+nano ~/.config/tuinadex/stereo-upright-dry-run.json
 ```
 
 启动三组试采会话：
@@ -70,10 +72,10 @@ nano ~/.config/tuinadex/stereo-dry-run.json
 ```bash
 source /home/mzq/miniconda3/etc/profile.d/conda.sh
 conda activate tuinadex_hw
-cd ~/projects/TuinaDex
+cd ~/projects/TuinaDex-stereo-calibration
 python -m tools.stereo_calibration.main \
-  --config ~/.config/tuinadex/stereo-dry-run.json \
-  --session stereo-dry-run
+  --config ~/.config/tuinadex/stereo-upright-dry-run.json \
+  --session stereo-upright-dry-run
 ```
 
 启动成功后终端会显示：
@@ -82,7 +84,8 @@ python -m tools.stereo_calibration.main \
 - Mac 需要执行的 SSH 隧道命令；
 - 当前会话目录；
 - 左右逻辑相机与 by-path 的对应关系；
-- 右相机的 `180°` 归一化。
+- 左相机 `270°`、右相机 `90°` 的数字转正；
+- 每侧逻辑画面尺寸为 `960x1280`。
 
 如果不写 `--session`，程序会创建带微秒的时间戳会话名。
 
@@ -112,7 +115,9 @@ IP 可能每次换网络后改变，不要把这个示例当成固定地址。�
 2. 画面左上，标定板略向一侧倾斜；
 3. 画面右下，向反方向倾斜。
 
-每次都要等待左右两卡显示 **54/54 且可保存**，然后停止移动标定板，再点击「保存这一组」。第三组保存后用 `Ctrl+C` 退出，重新执行同一条命令；计数仍应是 3，下一组编号应为 4。
+每次都要等待左右两卡显示 **54/54 且可保存**，然后停止移动标定板，再点击「保存这一组」。
+如果与上一组角点变化不足 15 px，按钮会保持禁用；请明显移动、倾斜或改变距离。
+第三组保存后用 `Ctrl+C` 退出，重新执行同一条命令；计数仍应是 3，下一组编号应为 4。
 
 ## 8. 正式 30 组姿态清单
 
@@ -134,6 +139,7 @@ IP 可能每次换网络后改变，不要把这个示例当成固定地址。�
 - 校正后纵向误差中位数必须小于 1.0 px；
 - 校正后纵向误差 P95 必须小于 2.0 px；
 - 估计基线与直尺实测值的偏差不得超过 15%；
+- 平移向量必须以 X 分量为主，报告中的“水平基线”必须为“是”；
 - 至少保留 18 组有效图，建议最终约 25 组；
 - `suspected_outliers` 只是疑似离群组，程序不会自动删除或静默排除；
 - `skipped_pairs` 记录因文件或元数据异常而未参与计算的组号和原因。
@@ -143,6 +149,7 @@ IP 可能每次换网络后改变，不要把这个示例当成固定地址。�
 ## 10. 恢复、重连与安全退出
 
 - **恢复会话：** 再次使用相同 `--session` 名称和完全一致的配置。任何相机路径、棋盘格、阈值、V4L2 参数或基线变化都会拒绝恢复；
+- **旧数据：** `stereo-dry-run-20260827` 使用旧方向，只保留审计，不要用新配置恢复或覆盖；
 - **相机掉线：** 查看页面错误，确认 USB 和 by-path，再点击「重新连接相机」。不会删除已保存数据；
 - **移除误拍：** 「移除上一组」会把最新有效组移到 `rejected/`，不是永久删除；
 - **安全退出：** 在 Ubuntu 运行服务的终端按 `Ctrl+C`。程序会先关闭 HTTP 监听，再通知相机工作线程释放两个设备；

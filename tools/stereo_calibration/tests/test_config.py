@@ -198,8 +198,10 @@ def test_loads_committed_example_configuration() -> None:
 
     assert config.left.device == LEFT_CAMERA_PATH
     assert config.right.device == RIGHT_CAMERA_PATH
-    assert config.right.rotation_degrees == 180
+    assert config.left.rotation_degrees == 270
+    assert config.right.rotation_degrees == 90
     assert config.capture.image_size == (1280, 960)
+    assert config.logical_image_size == (960, 1280)
     assert config.capture.fps == 30
     assert config.capture.fourcc == "MJPG"
     assert dict(config.capture.v4l2_controls) == {
