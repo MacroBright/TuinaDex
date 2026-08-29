@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic_ns
-from typing import Any, Callable
+from threading import Event, Lock, Thread
+from time import monotonic, monotonic_ns
+from typing import Any, Callable, Protocol
 
 import cv2
 import numpy as np
@@ -37,6 +38,23 @@ class RealtimeSnapshot:
     valid_points: int
     median_depth_mm: float
     timestamp_ns: int
+
+
+@dataclass(frozen=True)
+class RealtimeState:
+    sequence: int
+    snapshot: RealtimeSnapshot | None
+    fps: float
+    error: str | None
+    running: bool
+
+
+class _PairSource(Protocol):
+    def open(self) -> None: ...
+
+    def read(self) -> FramePair: ...
+
+    def close(self) -> None: ...
 
 
 def _readonly(array: NDArray[Any]) -> NDArray[Any]:
@@ -184,3 +202,105 @@ class RealtimeProcessor:
             median_depth_mm=median_depth,
             timestamp_ns=monotonic_ns(),
         )
+
+
+class RealtimeWorker:
+    """Own the cameras in one thread and publish only the latest processed frame."""
+
+    def __init__(
+        self,
+        source_factory: Callable[[], _PairSource],
+        processor: RealtimeProcessor,
+        *,
+        stop_timeout: float = 2.0,
+    ) -> None:
+        if stop_timeout <= 0:
+            raise ValueError("stop timeout must be positive")
+        self._source_factory = source_factory
+        self._processor = processor
+        self._stop_timeout = float(stop_timeout)
+        self._stop_event = Event()
+        self._lock = Lock()
+        self._state = RealtimeState(0, None, 0.0, None, False)
+        self._thread: Thread | None = None
+        self._started = False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                raise RuntimeError("realtime worker can only start once")
+            self._started = True
+            self._stop_event.clear()
+            self._state = RealtimeState(0, None, 0.0, None, True)
+            self._thread = Thread(
+                target=self._run,
+                name="realtime-stereo-worker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def state(self) -> RealtimeState:
+        with self._lock:
+            return self._state
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return
+        thread.join(self._stop_timeout)
+        if thread.is_alive():
+            raise RuntimeError("realtime camera worker did not stop within timeout")
+
+    def _run(self) -> None:
+        source: _PairSource | None = None
+        primary_error: str | None = None
+        previous_time: float | None = None
+        fps = 0.0
+        try:
+            source = self._source_factory()
+            source.open()
+            while not self._stop_event.is_set():
+                snapshot = self._processor.process(source.read())
+                now = monotonic()
+                if previous_time is not None and now > previous_time:
+                    instant = 1.0 / (now - previous_time)
+                    fps = instant if fps == 0.0 else 0.8 * fps + 0.2 * instant
+                previous_time = now
+                with self._lock:
+                    self._state = RealtimeState(
+                        self._state.sequence + 1,
+                        snapshot,
+                        fps,
+                        None,
+                        True,
+                    )
+        except Exception as exc:
+            primary_error = (str(exc) or exc.__class__.__name__).replace("\n", " ")[:500]
+            with self._lock:
+                self._state = RealtimeState(
+                    self._state.sequence + 1,
+                    None,
+                    fps,
+                    primary_error,
+                    False,
+                )
+        finally:
+            close_error: str | None = None
+            if source is not None:
+                try:
+                    source.close()
+                except Exception as exc:
+                    close_error = (str(exc) or exc.__class__.__name__).replace("\n", " ")[:500]
+            with self._lock:
+                error = primary_error
+                if close_error:
+                    error = f"{error}; camera close failed: {close_error}" if error else close_error
+                self._state = RealtimeState(
+                    self._state.sequence,
+                    None if error else self._state.snapshot,
+                    self._state.fps,
+                    error,
+                    False,
+                )

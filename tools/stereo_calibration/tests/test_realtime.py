@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic, sleep
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 
 from tools.stereo_calibration.cameras import FramePair
-from tools.stereo_calibration.realtime import RealtimeProcessor, load_calibration
+from tools.stereo_calibration.realtime import (
+    RealtimeProcessor,
+    RealtimeWorker,
+    load_calibration,
+)
 
 
 def _write_calibration(path: Path, width: int = 8, height: int = 6) -> Path:
@@ -85,3 +91,74 @@ def test_balanced_processor_restores_full_resolution_disparity(tmp_path: Path) -
     assert np.all(snapshot.colors_rgb == np.array([30, 20, 10], dtype=np.uint8))
     assert snapshot.valid_points == 48
     assert snapshot.median_depth_mm == pytest.approx(625.0)
+
+
+class _FakeSource:
+    def __init__(self) -> None:
+        self.open_calls = 0
+        self.close_calls = 0
+        self.read_calls = 0
+
+    def open(self) -> None:
+        self.open_calls += 1
+
+    def read(self) -> FramePair:
+        self.read_calls += 1
+        pair = _pair()
+        pair.left[0, 0, 0] = self.read_calls % 255
+        return pair
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _MarkerProcessor:
+    def process(self, pair: FramePair) -> SimpleNamespace:
+        return SimpleNamespace(marker=int(pair.left[0, 0, 0]))
+
+
+def _wait_until(predicate, timeout: float = 1.0) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if predicate():
+            return
+        sleep(0.005)
+    raise AssertionError("condition was not reached")
+
+
+def test_worker_replaces_old_snapshot_and_releases_camera() -> None:
+    source = _FakeSource()
+    worker = RealtimeWorker(lambda: source, _MarkerProcessor())
+
+    worker.start()
+    _wait_until(lambda: worker.state().sequence >= 2)
+    worker.stop()
+
+    state = worker.state()
+    assert state.sequence >= 2
+    assert state.snapshot.marker == state.sequence % 255
+    assert source.open_calls == 1
+    assert source.close_calls == 1
+
+
+def test_worker_clears_stale_snapshot_when_processing_fails() -> None:
+    source = _FakeSource()
+
+    class FailingAfterOne:
+        calls = 0
+
+        def process(self, pair: FramePair) -> SimpleNamespace:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("processing failed")
+            return SimpleNamespace(marker=1)
+
+    worker = RealtimeWorker(lambda: source, FailingAfterOne())
+    worker.start()
+    _wait_until(lambda: worker.state().error is not None)
+    worker.stop()
+
+    state = worker.state()
+    assert state.snapshot is None
+    assert state.error == "processing failed"
+    assert source.close_calls == 1
