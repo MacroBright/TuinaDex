@@ -9,7 +9,7 @@
 - 双目校正矩阵、重映射表和 `Q` 矩阵；
 - RMS、校正后纵向误差、疑似离群组和校正预览图。
 
-它现在不生成稠密深度图或点云，不训练 LeRobot 模型，也不控制机械臂或灵巧手。这些属于标定验收后的下一阶段。
+它还能在标定验收后生成单帧点云，或在 Ubuntu 本地窗口显示实时彩色画面、深度图和可交互点云。它不训练 LeRobot 模型，也不控制机械臂或灵巧手。
 
 ## 2. 实物检查清单
 
@@ -164,3 +164,26 @@ IP 可能每次换网络后改变，不要把这个示例当成固定地址。�
 这两台普通 USB 相机没有硬件触发线，程序只能先对两边 `grab()`，然后尽快分别取回画面。对于静止棋盘格和静止裸露背部，这种方式足以完成标定和后续静态建模。
 
 后续如果要重建快速移动的灵巧手或人体，左右帧的微小时差会变成明显误差。那时需要单独评估硬件同步相机或触发线，不能把当前静态标定流程直接当成动态三维方案。
+
+## 13. Ubuntu 本地实时点云
+
+实时界面使用 Open3D 0.19。只在 `tuinadex_hw` 环境首次安装：
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate tuinadex_hw
+python -m pip install "open3d==0.19.0"
+```
+
+在 **Ubuntu 桌面本机终端** 运行，不要在普通 SSH 终端运行：
+
+```bash
+cd ~/projects/TuinaDex-stereo-calibration
+python -m tools.stereo_calibration.realtime_viewer \
+  --config ~/.config/tuinadex/stereo-upright-dry-run.json \
+  --calibration ~/projects/TuinaDex/data/stereo_calibration/stereo-recalibration-v2-20260828/results/20260828-215540665234/stereo_calibration.npz
+```
+
+单窗口左侧显示彩色画面和深度伪彩色图，右侧显示可旋转、平移、缩放的彩色点云。顶部显示实际 FPS、有效像素数、点数和中位深度。
+
+平衡模式在 50% 分辨率计算视差，再恢复到原标定尺度，以降低延迟。「暂停」只冻结界面，「重置视角」会在下一帧重新对准有效点云。退出窗口时程序会在工作线程释放两台相机。
