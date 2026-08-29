@@ -1,12 +1,10 @@
-"""Ubuntu-local Open3D window for live stereo video, depth, and point cloud."""
+"""Ubuntu-local PyQtGraph window for live stereo video, depth, and point cloud."""
 
 from __future__ import annotations
 
 import argparse
 import os
-import threading
 from pathlib import Path
-from time import sleep
 from typing import Any, Sequence
 
 import cv2
@@ -35,182 +33,191 @@ def _require_local_display() -> None:
         )
 
 
-def _load_open3d() -> Any:
+def _load_qt() -> tuple[Any, Any, Any, Any]:
+    # Keep Qt and PyOpenGL on the same XWayland/GLX backend. On this Ubuntu
+    # Wayland session Qt otherwise selects EGL while PyOpenGL queries GLX.
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_glx")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
     try:
-        import open3d as o3d
+        from PyQt5 import QtCore, QtGui, QtWidgets
+        import pyqtgraph.opengl as gl
     except ImportError as exc:
         raise RuntimeError(
-            "Open3D is not installed. Activate tuinadex_hw and run: "
-            "python -m pip install open3d==0.19.0"
+            "PyQtGraph viewer dependencies are missing. Activate tuinadex_hw and run: "
+            "python -m pip install PyQt5==5.15.11 pyqtgraph==0.13.7 PyOpenGL==3.1.10"
         ) from exc
-    return o3d
+    # opencv-python sets this to its private Qt plugin directory during import.
+    # That directory is incompatible with the separately installed PyQt5 runtime.
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = QtCore.QLibraryInfo.location(
+        QtCore.QLibraryInfo.PluginsPath
+    )
+    return QtCore, QtGui, QtWidgets, gl
 
 
-class _Viewer:
-    def __init__(self, o3d: Any, worker: RealtimeWorker) -> None:
-        self.o3d = o3d
-        self.gui = o3d.visualization.gui
-        self.rendering = o3d.visualization.rendering
-        self.worker = worker
-        self.app = self.gui.Application.instance
-        self.window = self.app.create_window("TuinaDex 实时双目点云", 1600, 900)
-        self.status = self.gui.Label("正在启动相机…")
-        self.pause_button = self.gui.Button("暂停")
-        self.reset_button = self.gui.Button("重置视角")
-        self.exit_button = self.gui.Button("退出")
-        self.left_image = self.gui.ImageWidget()
-        self.depth_image = self.gui.ImageWidget()
-        self.scene_widget = self.gui.SceneWidget()
-        self.scene_widget.scene = self.rendering.Open3DScene(self.window.renderer)
-        self.scene_widget.scene.set_background(np.array([0.02, 0.03, 0.04, 1.0]))
-        self.material = self.rendering.MaterialRecord()
-        self.material.shader = "defaultUnlit"
-        self.material.point_size = 3.0
-        self.paused = False
-        self.camera_initialized = False
-        self.last_sequence = -1
-        self.closing = threading.Event()
-        self.poll_thread: threading.Thread | None = None
+def _build_window_class(
+    QtCore: Any,
+    QtGui: Any,
+    QtWidgets: Any,
+    gl: Any,
+) -> type:
+    class RealtimeWindow(QtWidgets.QMainWindow):
+        def __init__(self, worker: RealtimeWorker) -> None:
+            super().__init__()
+            self.worker = worker
+            self.paused = False
+            self.last_sequence = -1
+            self.camera_initialized = False
+            self.closed = False
 
-        for widget in (
-            self.status,
-            self.pause_button,
-            self.reset_button,
-            self.exit_button,
-            self.left_image,
-            self.depth_image,
-            self.scene_widget,
-        ):
-            self.window.add_child(widget)
-        self.window.set_on_layout(self._on_layout)
-        self.window.set_on_close(self._on_close)
-        self.pause_button.set_on_clicked(self._toggle_pause)
-        self.reset_button.set_on_clicked(self._reset_view)
-        self.exit_button.set_on_clicked(self._exit)
+            self.setWindowTitle("TuinaDex 实时双目点云")
+            self.resize(1600, 900)
+            central = QtWidgets.QWidget()
+            self.setCentralWidget(central)
+            root = QtWidgets.QVBoxLayout(central)
 
-    def start(self) -> None:
-        self.worker.start()
-        self.poll_thread = threading.Thread(
-            target=self._poll,
-            name="realtime-viewer-poll",
-            daemon=True,
-        )
-        self.poll_thread.start()
+            toolbar = QtWidgets.QHBoxLayout()
+            self.status = QtWidgets.QLabel("正在启动相机…")
+            self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            self.pause_button = QtWidgets.QPushButton("暂停")
+            self.reset_button = QtWidgets.QPushButton("重置视角")
+            self.exit_button = QtWidgets.QPushButton("退出")
+            toolbar.addWidget(self.status, 1)
+            toolbar.addWidget(self.pause_button)
+            toolbar.addWidget(self.reset_button)
+            toolbar.addWidget(self.exit_button)
+            root.addLayout(toolbar)
 
-    def _on_layout(self, _context: Any) -> None:
-        rect = self.window.content_rect
-        gap = 8
-        status_height = 30
-        toolbar_height = 38
-        left_width = max(360, int(rect.width * 0.36))
-        image_height = max(180, (rect.height - status_height - toolbar_height - 3 * gap) // 2)
-        self.status.frame = self.gui.Rect(rect.x + gap, rect.y, rect.width - 2 * gap, status_height)
-        toolbar_y = rect.y + status_height + gap
-        button_width = 105
-        self.pause_button.frame = self.gui.Rect(rect.x + gap, toolbar_y, button_width, toolbar_height)
-        self.reset_button.frame = self.gui.Rect(
-            rect.x + gap + button_width + gap, toolbar_y, button_width, toolbar_height
-        )
-        self.exit_button.frame = self.gui.Rect(
-            rect.x + gap + 2 * (button_width + gap), toolbar_y, button_width, toolbar_height
-        )
-        content_y = toolbar_y + toolbar_height + gap
-        self.left_image.frame = self.gui.Rect(rect.x + gap, content_y, left_width, image_height)
-        self.depth_image.frame = self.gui.Rect(
-            rect.x + gap,
-            content_y + image_height + gap,
-            left_width,
-            image_height,
-        )
-        scene_x = rect.x + left_width + 2 * gap
-        self.scene_widget.frame = self.gui.Rect(
-            scene_x,
-            content_y,
-            max(200, rect.width - left_width - 3 * gap),
-            max(200, rect.height - content_y + rect.y - gap),
-        )
+            splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+            images = QtWidgets.QWidget()
+            images_layout = QtWidgets.QVBoxLayout(images)
+            images_layout.setContentsMargins(0, 0, 0, 0)
+            self.left_image = self._image_panel(images_layout, "左相机（已校正）")
+            self.depth_image = self._image_panel(images_layout, "深度伪彩色")
+            splitter.addWidget(images)
 
-    def _poll(self) -> None:
-        while not self.closing.is_set():
+            self.scene = gl.GLViewWidget()
+            self.scene.setBackgroundColor((5, 8, 12, 255))
+            self.points = gl.GLScatterPlotItem(
+                pos=np.empty((0, 3), dtype=np.float32),
+                color=np.empty((0, 4), dtype=np.float32),
+                size=2.0,
+                pxMode=True,
+            )
+            self.scene.addItem(self.points)
+            splitter.addWidget(self.scene)
+            splitter.setSizes([560, 1040])
+            root.addWidget(splitter, 1)
+
+            self.pause_button.clicked.connect(self._toggle_pause)
+            self.reset_button.clicked.connect(self._request_reset)
+            self.exit_button.clicked.connect(self.close)
+            self.timer = QtCore.QTimer(self)
+            self.timer.setInterval(40)
+            self.timer.timeout.connect(self._poll)
+
+        def _image_panel(self, layout: Any, title: str) -> Any:
+            label = QtWidgets.QLabel(title)
+            layout.addWidget(label)
+            image = QtWidgets.QLabel("等待图像…")
+            image.setAlignment(QtCore.Qt.AlignCenter)
+            image.setMinimumSize(320, 220)
+            image.setStyleSheet("background: #05080c; color: #aeb8c4;")
+            image.setSizePolicy(
+                QtWidgets.QSizePolicy.Ignored,
+                QtWidgets.QSizePolicy.Ignored,
+            )
+            layout.addWidget(image, 1)
+            return image
+
+        def start(self) -> None:
+            self.worker.start()
+            self.timer.start()
+
+        def _poll(self) -> None:
             state = self.worker.state()
-            if state.sequence != self.last_sequence:
-                self.last_sequence = state.sequence
-                self.app.post_to_main_thread(
-                    self.window,
-                    lambda current=state: self._apply_state(current),
-                )
-            sleep(0.04)
+            if state.sequence == self.last_sequence:
+                return
+            self.last_sequence = state.sequence
+            if state.error:
+                self.status.setText(f"错误：{state.error}")
+                return
+            snapshot = state.snapshot
+            if snapshot is None:
+                self.status.setText("正在等待第一帧…")
+                return
+            depth_text = (
+                f"{snapshot.median_depth_mm:.0f} mm"
+                if np.isfinite(snapshot.median_depth_mm)
+                else "无有效深度"
+            )
+            self.status.setText(
+                f"{state.fps:4.1f} FPS  |  有效像素 {snapshot.valid_points:,}  |  "
+                f"点云 {len(snapshot.points_xyz):,} 点  |  中位深度 {depth_text}"
+            )
+            if self.paused:
+                return
+            self._set_image(self.left_image, snapshot.left_bgr)
+            self._set_image(self.depth_image, snapshot.depth_bgr)
+            self._set_cloud(snapshot)
 
-    def _apply_state(self, state: Any) -> None:
-        if self.closing.is_set():
-            return
-        if state.error:
-            self.status.text = f"错误：{state.error}"
-            return
-        snapshot = state.snapshot
-        if snapshot is None:
-            self.status.text = "正在等待第一帧…"
-            return
-        self.status.text = (
-            f"{state.fps:4.1f} FPS  |  有效像素 {snapshot.valid_points:,}  |  "
-            f"点云 {len(snapshot.points_xyz):,} 点  |  "
-            f"中位深度 {snapshot.median_depth_mm:.0f} mm"
-        )
-        if self.paused:
-            return
-        self._update_images(snapshot)
-        self._update_point_cloud(snapshot)
-        self.window.post_redraw()
+        def _set_image(self, label: Any, bgr: np.ndarray) -> None:
+            rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            height, width, _ = rgb.shape
+            image = QtGui.QImage(
+                rgb.data,
+                width,
+                height,
+                rgb.strides[0],
+                QtGui.QImage.Format_RGB888,
+            ).copy()
+            pixmap = QtGui.QPixmap.fromImage(image).scaled(
+                label.size(),
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
+            label.setPixmap(pixmap)
 
-    def _update_images(self, snapshot: RealtimeSnapshot) -> None:
-        left_rgb = cv2.cvtColor(snapshot.left_bgr, cv2.COLOR_BGR2RGB)
-        depth_rgb = cv2.cvtColor(snapshot.depth_bgr, cv2.COLOR_BGR2RGB)
-        self.left_image.update_image(self.o3d.geometry.Image(np.ascontiguousarray(left_rgb)))
-        self.depth_image.update_image(self.o3d.geometry.Image(np.ascontiguousarray(depth_rgb)))
+        def _set_cloud(self, snapshot: RealtimeSnapshot) -> None:
+            xyz = snapshot.points_xyz.astype(np.float32, copy=True) / 1000.0
+            if len(xyz):
+                xyz[:, 1:] *= -1.0
+                rgba = np.empty((len(xyz), 4), dtype=np.float32)
+                rgba[:, :3] = snapshot.colors_rgb.astype(np.float32) / 255.0
+                rgba[:, 3] = 1.0
+            else:
+                rgba = np.empty((0, 4), dtype=np.float32)
+            self.points.setData(pos=xyz, color=rgba, size=2.0, pxMode=True)
+            if len(xyz) and not self.camera_initialized:
+                center = np.median(xyz, axis=0)
+                span = np.percentile(xyz, 95, axis=0) - np.percentile(xyz, 5, axis=0)
+                distance = max(0.4, float(np.max(span)) * 1.8)
+                self.scene.opts["center"] = QtGui.QVector3D(*map(float, center))
+                self.scene.setCameraPosition(distance=distance, elevation=5, azimuth=-90)
+                self.camera_initialized = True
 
-    def _update_point_cloud(self, snapshot: RealtimeSnapshot) -> None:
-        if len(snapshot.points_xyz) == 0:
-            return
-        cloud = self.o3d.geometry.PointCloud()
-        cloud.points = self.o3d.utility.Vector3dVector(
-            snapshot.points_xyz.astype(np.float64) / 1000.0
-        )
-        cloud.colors = self.o3d.utility.Vector3dVector(
-            snapshot.colors_rgb.astype(np.float64) / 255.0
-        )
-        if self.scene_widget.scene.has_geometry("live_points"):
-            self.scene_widget.scene.remove_geometry("live_points")
-        self.scene_widget.scene.add_geometry("live_points", cloud, self.material)
-        if not self.camera_initialized:
-            bounds = cloud.get_axis_aligned_bounding_box()
-            self.scene_widget.setup_camera(60.0, bounds, bounds.get_center())
-            self.camera_initialized = True
+        def _toggle_pause(self) -> None:
+            self.paused = not self.paused
+            self.pause_button.setText("继续" if self.paused else "暂停")
 
-    def _toggle_pause(self) -> None:
-        self.paused = not self.paused
-        self.pause_button.text = "继续" if self.paused else "暂停"
+        def _request_reset(self) -> None:
+            self.camera_initialized = False
 
-    def _reset_view(self) -> None:
-        self.camera_initialized = False
+        def closeEvent(self, event: Any) -> None:
+            self._shutdown()
+            event.accept()
 
-    def _exit(self) -> None:
-        self._shutdown()
-        self.app.quit()
+        def _shutdown(self) -> None:
+            if self.closed:
+                return
+            self.closed = True
+            self.timer.stop()
+            try:
+                self.worker.stop()
+            except RuntimeError as exc:
+                print(f"退出警告：{exc}")
 
-    def _on_close(self) -> bool:
-        self._shutdown()
-        return True
-
-    def _shutdown(self) -> None:
-        if self.closing.is_set():
-            return
-        self.closing.set()
-        try:
-            self.worker.stop()
-        except RuntimeError as exc:
-            print(f"退出警告：{exc}")
-        if self.poll_thread is not None and self.poll_thread is not threading.current_thread():
-            self.poll_thread.join(0.5)
+    return RealtimeWindow
 
 
 def run(args: argparse.Namespace) -> int:
@@ -224,14 +231,15 @@ def run(args: argparse.Namespace) -> int:
         stride=args.stride,
     )
     worker = RealtimeWorker(lambda: OpenCVCameraPair(config), processor)
-    o3d = _load_open3d()
-    app = o3d.visualization.gui.Application.instance
-    app.initialize()
-    viewer = _Viewer(o3d, worker)
-    viewer.start()
-    app.run()
-    viewer._shutdown()
-    return 0
+    QtCore, QtGui, QtWidgets, gl = _load_qt()
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window_class = _build_window_class(QtCore, QtGui, QtWidgets, gl)
+    window = window_class(worker)
+    window.show()
+    window.start()
+    result = int(application.exec_())
+    window._shutdown()
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -167,12 +167,12 @@ IP 可能每次换网络后改变，不要把这个示例当成固定地址。�
 
 ## 13. Ubuntu 本地实时点云
 
-实时界面使用 Open3D 0.19。只在 `tuinadex_hw` 环境首次安装：
+实时界面使用 PyQt5 + PyQtGraph。只在 `tuinadex_hw` 环境首次安装：
 
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate tuinadex_hw
-python -m pip install "open3d==0.19.0"
+python -m pip install "PyQt5==5.15.11" "pyqtgraph==0.13.7" "PyOpenGL==3.1.10"
 ```
 
 在 **Ubuntu 桌面本机终端** 运行，不要在普通 SSH 终端运行：

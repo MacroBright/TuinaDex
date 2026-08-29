@@ -2,18 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build one Ubuntu-local Open3D window that displays the live left image, depth colormap, and interactive coloured point cloud at a balanced target of roughly 5 FPS.
+**Goal:** Build one Ubuntu-local PyQtGraph window that displays the live left image, depth colormap, and interactive coloured point cloud at a balanced target of roughly 5 FPS.
 
-**Architecture:** A reusable processor validates the saved calibration, rectifies one stereo pair, computes half-resolution SGBM disparity, rescales it to the calibrated resolution, and publishes an immutable display snapshot. A single worker thread exclusively owns `OpenCVCameraPair`; the Open3D GUI main thread polls only the latest snapshot and never queues stale frames.
+**Architecture:** A reusable processor validates the saved calibration, rectifies one stereo pair, computes half-resolution SGBM disparity, rescales it to the calibrated resolution, and publishes an immutable display snapshot. A single worker thread exclusively owns `OpenCVCameraPair`; the Qt GUI main thread polls only the latest snapshot and never queues stale frames.
 
-**Tech Stack:** Python 3.10, NumPy 2.2, OpenCV 5, Open3D 0.19, V4L2, pytest.
+**Tech Stack:** Python 3.10, NumPy 2.2, OpenCV 5, PyQt5 5.15, PyQtGraph 0.13, PyOpenGL 3.1, V4L2, pytest.
 
 ---
 
 ## File map
 
 - Create `tools/stereo_calibration/realtime.py`: calibration loading, balanced-mode depth/point-cloud processing, latest-frame worker state.
-- Create `tools/stereo_calibration/realtime_viewer.py`: CLI and Ubuntu-local Open3D GUI.
+- Create `tools/stereo_calibration/realtime_viewer.py`: CLI and Ubuntu-local PyQtGraph GUI.
 - Create `tools/stereo_calibration/tests/test_realtime.py`: focused processor and worker lifecycle tests.
 - Modify `tools/stereo_calibration/README.md`: installation and exact launch command.
 
@@ -72,7 +72,7 @@ git add tools/stereo_calibration/realtime.py tools/stereo_calibration/tests/test
 git commit -m "feat: add realtime stereo point cloud processor"
 ```
 
-### Task 2: Latest-frame worker and single Open3D window
+### Task 2: Latest-frame worker and single PyQtGraph window
 
 **Files:**
 - Modify: `tools/stereo_calibration/realtime.py`
@@ -102,19 +102,19 @@ Run the focused pytest command. Expected: fails because `RealtimeWorker` and its
 
 Add a condition-protected `RealtimeState(sequence, snapshot, fps, error)` and `RealtimeWorker`. The worker opens the pair source inside its thread, processes continuously, replaces one stored snapshot, calculates a rolling FPS, and always closes the source in `finally`. `stop()` sets an event and joins with a bounded timeout; timeout is reported as an explicit runtime error.
 
-- [ ] **Step 4: Implement the Open3D GUI CLI**
+- [ ] **Step 4: Implement the PyQtGraph GUI CLI**
 
 `realtime_viewer.py` must:
 
 - validate `DISPLAY` or `WAYLAND_DISPLAY` before opening cameras;
-- import `open3d` lazily and explain how to install `open3d==0.19.0` if missing;
+- import PyQt5/PyQtGraph lazily and explain how to install the pinned GUI dependencies if missing;
 - parse `--config`, `--calibration`, `--min-depth-mm`, `--max-depth-mm`, and `--stride`;
-- create one Open3D GUI window with two `ImageWidget`s on the left, one `SceneWidget` on the right, status text, pause/resume, reset-view, and exit buttons;
+- create one Qt GUI window with two image labels on the left, one `GLViewWidget` on the right, status text, pause/resume, reset-view, and exit buttons;
 - update widgets from the main thread using the latest immutable snapshot;
 - replace the point-cloud geometry under a fixed name instead of adding new geometry each frame;
 - call `worker.stop()` once when the window closes.
 
-The GUI must use `window.set_on_layout`, `window.set_on_close`, and `gui.Application.instance.post_to_main_thread()` rather than modifying widgets from the camera worker.
+The GUI must use a Qt main-thread timer to poll immutable worker state rather than modifying widgets from the camera worker.
 
 - [ ] **Step 5: Run focused tests and compile checks**
 
@@ -143,7 +143,7 @@ git commit -m "feat: add Ubuntu realtime point cloud viewer"
 
 - [ ] **Step 1: Document exact local launch instructions**
 
-Add a section that installs `open3d==0.19.0` in `tuinadex_hw` and runs:
+Add a section that installs pinned PyQt5/PyQtGraph/PyOpenGL packages in `tuinadex_hw` and runs:
 
 ```bash
 cd ~/projects/TuinaDex-stereo-calibration
@@ -167,7 +167,7 @@ git push upstream codex/stereo-calibration
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate tuinadex_hw
-python -m pip install "open3d==0.19.0"
+python -m pip install "PyQt5==5.15.11" "pyqtgraph==0.13.7" "PyOpenGL==3.1.10"
 cd ~/projects/TuinaDex-stereo-calibration
 git pull --ff-only origin codex/stereo-calibration
 ```

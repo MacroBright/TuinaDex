@@ -24,7 +24,7 @@ python -m tools.stereo_calibration.realtime_viewer \
 
 - 左上：左相机彩色画面；
 - 左下：深度伪彩色图，无效深度为黑色；
-- 右侧：Open3D 三维场景，鼠标可旋转、缩放和平移；
+- 右侧：PyQtGraph OpenGL 三维场景，鼠标可旋转、缩放和平移；
 - 顶部状态栏：实际 FPS、有效点数、中位深度和错误状态；
 - 控件：暂停/继续、重置三维视角、退出。
 
@@ -37,7 +37,7 @@ python -m tools.stereo_calibration.realtime_viewer \
 3. 平衡模式将校正画面缩小到 50% 计算 SGBM 视差，搜索范围按同一比例从 `-256…-1 px` 缩放为 `-128…-1 px`。
 4. 视差图放大回标定分辨率并乘以 2，再用原始 Q 矩阵反投影，保持毫米深度尺度。
 5. 过滤非有限点、无效视差及 `200…5000 mm` 之外的点，再空间降采样以控制每帧点数。
-6. 工作线程只发布最新一帧不可变快照；Open3D GUI 主线程定时取最新快照并更新两张图像和点云。旧帧可被丢弃，不建立无限队列。
+6. 工作线程只发布最新一帧不可变快照；Qt GUI 主线程通过定时器取最新快照并更新两张图像和点云。旧帧可被丢弃，不建立无限队列。
 
 ## 性能与参数
 
@@ -57,7 +57,7 @@ python -m tools.stereo_calibration.realtime_viewer \
 ## 依赖与部署
 
 - 复用现有 `tuinadex_hw` Conda 环境中的 OpenCV、NumPy 和相机配置。
-- 新增 Open3D 作为 Ubuntu 本地 GUI 唯一新依赖。
+- 新增 PyQt5、PyQtGraph 和 PyOpenGL 用于 Ubuntu 本地 GUI。Open3D 0.19 在当前 Ubuntu Wayland/XWayland 会话中最小窗口也会段错误，因此不用于正式界面。
 - 程序必须在 Ubuntu 桌面会话中运行，需有可用的 `DISPLAY`/Wayland-XWayland；纯 SSH 无显示会话时给出明确错误。
 
 ## 验证范围
